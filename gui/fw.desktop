@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Femboi Firewall
+Name[tr]=Femboi Güvenlik Duvarı
+GenericName=Packet filter control
+GenericName[tr]=Paket filtresi denetimi
+Comment=Control the Femboi DDoS firewall (nftables + XDP)
+Comment[tr]=Femboi DDoS güvenlik duvarını yönet (nftables + XDP)
+Exec=/usr/local/bin/fw-gui
+Icon=fw
+Terminal=false
+Categories=System;Security;Monitor;
+Keywords=firewall;security;ddos;nftables;xdp;guvenlik;
+StartupNotify=true
+StartupWMClass=fw-gui

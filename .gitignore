@@ -1,0 +1,38 @@
+# Compiler and build artifacts
+bin/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+*.a
+*.lib
+
+# Zig toolchain & build cache
+tools/zig/
+tools/zig-extract/
+.freebuff/
+.zig-cache/
+zig-out/
+
+# Internal tool reports & retired code
+.mimosa/
+windows-retired/
+scratch/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python cache & logs
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# System files
+.DS_Store
+Thumbs.db

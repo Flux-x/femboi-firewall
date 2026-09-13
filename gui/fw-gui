@@ -1,0 +1,231 @@
+#!/usr/bin/python3
+"""Femboi Firewall — desktop control panel.
+
+The Linux firewall is a headless standalone daemon with CLI and XDP controls.
+This desktop app provides an operator UI for desktop/RDP sessions.
+
+It is a thin front end. Every button shells out to the same `fluxxfw` binary the
+CLI uses, so there is exactly one implementation of every action and no second
+source of truth to drift. Commands are passed as argument lists, never through a
+shell.
+"""
+
+import os
+import subprocess
+import sys
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+FLUXXFW = "/usr/local/bin/fluxxfw"
+UNIT = "femboi-firewall"
+
+BG = "#14161a"
+FG = "#e6e6e6"
+ACCENT = "#4ea1ff"
+OK = "#3ddc84"
+WARN = "#ffb454"
+ERR = "#ff5f56"
+
+
+def run(args, timeout=20):
+    """Run a command and return (rc, stdout+stderr). Never uses a shell."""
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except FileNotFoundError:
+        return 127, f"not found: {args[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+    except Exception as exc:  # noqa: BLE001
+        return 1, str(exc)
+
+
+def service_state():
+    rc, out = run(["systemctl", "is-active", UNIT])
+    state = out.strip() or "unknown"
+    return state, rc == 0
+
+
+class FirewallApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Femboi Firewall")
+        self.configure(bg=BG)
+        self.geometry("880x620")
+        self.minsize(760, 520)
+
+        self._build_header()
+        self._build_controls()
+        self._build_output()
+        self.refresh()
+
+    # ---- layout -----------------------------------------------------------
+    def _build_header(self):
+        head = tk.Frame(self, bg=BG)
+        head.pack(fill="x", padx=14, pady=(12, 6))
+
+        tk.Label(head, text="Femboi Firewall", bg=BG, fg=FG,
+                 font=("DejaVu Sans", 16, "bold")).pack(side="left")
+
+        self.status = tk.Label(head, text="checking…", bg=BG, fg=WARN,
+                               font=("DejaVu Sans", 11, "bold"))
+        self.status.pack(side="right")
+
+    def _build_controls(self):
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=14, pady=6)
+
+        def button(text, cmd, colour=ACCENT):
+            b = tk.Button(bar, text=text, command=cmd, bg=colour, fg="#0b0b0b",
+                          activebackground=colour, relief="flat",
+                          font=("DejaVu Sans", 10, "bold"), padx=14, pady=6)
+            b.pack(side="left", padx=(0, 8))
+            return b
+
+        button("Start", self.start)
+        button("Stop", self.stop, WARN)
+        button("Apply rules", self.apply)
+        button("Doctor", self.doctor)
+        button("Refresh", self.refresh)
+
+        # ban / unban
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", padx=14, pady=(4, 6))
+        tk.Label(row, text="IP", bg=BG, fg=FG).pack(side="left", padx=(0, 8))
+        self.ip_entry = tk.Entry(row, width=22, bg="#1e2229", fg=FG,
+                                 insertbackground=FG, relief="flat")
+        self.ip_entry.pack(side="left", padx=(0, 8))
+        tk.Button(row, text="Ban", command=self.ban, bg=ERR, fg="#0b0b0b",
+                  relief="flat", padx=12, pady=4).pack(side="left", padx=(0, 6))
+        tk.Button(row, text="Unban", command=self.unban, bg=OK, fg="#0b0b0b",
+                  relief="flat", padx=12, pady=4).pack(side="left", padx=(0, 6))
+        tk.Button(row, text="Blocked list", command=self.blocked, bg="#39404a",
+                  fg=FG, relief="flat", padx=12, pady=4).pack(side="left")
+
+        self.port_label = tk.Label(self, text="", bg=BG, fg="#9aa4b2",
+                                   font=("DejaVu Sans Mono", 9), anchor="w",
+                                   justify="left")
+        self.port_label.pack(fill="x", padx=14)
+
+    def _build_output(self):
+        wrap = tk.Frame(self, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=14, pady=(6, 12))
+
+        self.text = tk.Text(wrap, bg="#0f1115", fg=FG, relief="flat",
+                            insertbackground=FG, wrap="word",
+                            font=("DejaVu Sans Mono", 9))
+        scroll = ttk.Scrollbar(wrap, command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+
+    # ---- helpers ----------------------------------------------------------
+    def write(self, message):
+        self.text.insert("end", message.rstrip() + "\n")
+        self.text.see("end")
+
+    def clear(self):
+        self.text.delete("1.0", "end")
+
+    def show(self, title, args):
+        self.clear()
+        self.write(f"$ {' '.join(args)}")
+        self.write("-" * 60)
+        rc, out = run(args)
+        self.write(out or "(no output)")
+        if rc != 0:
+            self.write(f"\n[exit {rc}]")
+
+    def refresh(self):
+        if not os.path.exists(FLUXXFW):
+            self.status.configure(text="fluxxfw NOT INSTALLED", fg=ERR)
+            return
+        state, active = service_state()
+        self.status.configure(text=f"daemon: {state}",
+                              fg=OK if active else WARN)
+
+        # Ports come from the config, not from a live query: they are what the
+        # ruleset was generated from, and a failure here is worth seeing.
+        conf = "/etc/femboi/firewall.conf"
+        ports = "(no config)"
+        try:
+            with open(conf, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("ports="):
+                        ports = line.split("=", 1)[1].strip()
+                        break
+        except Exception as exc:  # noqa: BLE001
+            ports = f"({exc})"
+        self.port_label.configure(text=f"protected ports: {ports}\nconfig: {conf}")
+
+    # ---- actions ----------------------------------------------------------
+    def start(self):
+        rc, out = run(["systemctl", "start", UNIT], timeout=40)
+        self.clear()
+        self.write(out or "start requested")
+        self.refresh()
+
+    def stop(self):
+        if not messagebox.askyesno("Stop firewall",
+                                   "Stop the firewall daemon?\n\n"
+                                   "Traffic will no longer be filtered or rate limited "
+                                   "until it is started again."):
+            return
+        rc, out = run(["systemctl", "stop", UNIT], timeout=40)
+        self.clear()
+        self.write(out or "stop requested")
+        self.refresh()
+
+    def apply(self):
+        self.show("apply", [FLUXXFW, "apply"])
+
+    def doctor(self):
+        self.show("doctor", [FLUXXFW, "doctor"])
+
+    def blocked(self):
+        self.show("list", [FLUXXFW, "list"])
+
+    def _ip(self):
+        ip = self.ip_entry.get().strip()
+        if not ip:
+            messagebox.showwarning("No IP", "Type an IP address first.")
+            return None
+        return ip
+
+    def ban(self):
+        ip = self._ip()
+        if ip:
+            self.show("ban", [FLUXXFW, "ban", ip])
+
+    def unban(self):
+        ip = self._ip()
+        if ip:
+            self.show("unban", [FLUXXFW, "unban", ip])
+
+
+def main():
+    if "--check" in sys.argv:
+        # Headless smoke test: catch a missing binary or a broken Tk before
+        # anyone has to click anything.
+        print("fluxxfw:", "present" if os.path.exists(FLUXXFW) else "MISSING")
+        print("service :", service_state()[0])
+        try:
+            import tkinter  # noqa: F401
+            print("tkinter : present")
+        except Exception as exc:  # noqa: BLE001
+            print("tkinter : MISSING —", exc)
+            return 1
+        return 0
+
+    try:
+        FirewallApp().mainloop()
+    except Exception as exc:  # noqa: BLE001
+        # A GUI that dies silently when launched from a menu is unfixable by the
+        # person clicking it, so say something on stderr as well.
+        print("fluxxfw-gui failed:", exc, file=sys.stderr)
+        raise
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

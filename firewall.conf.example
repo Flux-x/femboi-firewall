@@ -1,0 +1,38 @@
+# Femboi Firewall configuration
+# Location: /etc/femboi/firewall.conf
+
+# Master switch: 1 enabled, 0 idle
+enabled=1
+
+# Protected ports: port/proto comma separated
+ports=27016/udp,27015/udp,80/tcp,443/tcp,8080/tcp
+
+# Drop traffic from datacenter and VPS ranges
+datacenter_filter=1
+
+# Enable country geo-filtering
+geo_enabled=1
+
+# Enable threat intelligence feed
+cti_enabled=1
+
+# Auto-ban IPs exceeding threshold
+auto_ban=1
+ban_seconds=3600
+
+# Per source IP rate limits
+per_ip_pps=1000
+rate_burst=2000
+
+# Userspace DPI packet inspection
+dpi_enabled=0
+dpi_queue=200
+
+# XDP datapath integration
+xdp_enabled=1
+xdp_pin_dir=/sys/fs/bpf/femboifw
+
+# Storage and rule file paths
+geoip_path=/usr/share/femboi/geoip.dat
+rules_path=/etc/femboi/geo_rules.json
+state_dir=/var/lib/femboi
