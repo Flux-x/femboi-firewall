@@ -86,6 +86,11 @@ std::string trim(const std::string& s) {
 bool Config::Load(const std::string& path, std::string* err) {
     ApplyDefaults();
 
+    if (path.empty() || path.find("..") != std::string::npos) {
+        if (err) *err = "invalid config path: " + path;
+        return false;
+    }
+
     std::ifstream in(path);
     if (!in) {
         if (err) *err = "config not found: " + path;

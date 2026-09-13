@@ -210,17 +210,260 @@ void seed_defaults(const XdpMaps& m) {
 
 } // namespace
 
-/**
- * @brief Entrypoint for the XDP control utility (femboi-firewall-xdp).
- * 
- * Manages eBPF XDP datapath operations including program attachment,
- * detachment, BPF map inspection, real-time telemetry counters,
- * whitelist/blacklist manipulation, and configuration synchronization.
- * 
- * @param argc Number of command-line arguments.
- * @param argv Array of command-line argument strings.
- * @return int 0 on success, non-zero error code on failure.
- */
+// Perform system and environment sanity checks
+static int HandleDoctor(const std::string& iface, const std::string& pin_dir) {
+    int bad = 0;
+    std::cout << "femboi-firewall-xdp doctor\n--------------------------\n";
+
+    if (is_root()) std::cout << "[ok]   root\n";
+    else { std::cout << "[FAIL] not root\n"; bad++; }
+
+    struct stat st{};
+    if (stat("/sys/fs/bpf", &st) == 0)
+        std::cout << "[ok]   bpffs mounted\n";
+    else { std::cout << "[FAIL] /sys/fs/bpf missing\n"; bad++; }
+
+    std::string out, err;
+    if (run_argv({"bpftool", "version"}, &out, &err))
+        std::cout << "[ok]   " << out.substr(0, out.find('\n')) << "\n";
+    else { std::cout << "[FAIL] bpftool not found\n"; bad++; }
+
+    if (run_argv({"ip", "-V"}, &out, &err))
+        std::cout << "[ok]   " << out.substr(0, out.find('\n')) << "\n";
+    else { std::cout << "[FAIL] iproute2 not found\n"; bad++; }
+
+    std::cout << "[info] default interface: " << iface << "\n";
+    std::cout << "[info] pin dir:           " << pin_dir << "\n";
+    std::cout << "--------------------------\n";
+    std::cout << (bad ? std::to_string(bad) + " problem(s) found\n" : "Ready to attach.\n");
+    return bad ? 1 : 0;
+}
+
+// Attach XDP program to network interface
+static int HandleAttach(const std::string& iface, const std::string& mode, const std::string& obj,
+                         bool egress, const std::string& pin_dir) {
+    if (!is_root()) { std::cerr << "error: attach needs root\n"; return 1; }
+    mkdir("/sys/fs/bpf", 0755);
+    mkdir(pin_dir.c_str(), 0700);
+    std::string err;
+    const int rc = cmd_attach(iface, mode, obj, egress, &err);
+    if (rc != 0) { std::cerr << "error: " << err << "\n"; return rc; }
+
+    XdpMaps maps;
+    if (maps.Open(pin_dir, &err)) {
+        seed_defaults(maps);
+    } else {
+        std::cerr << "warning: maps not open (" << err << ")\n";
+    }
+    return rc;
+}
+
+// Detach XDP program from network interface
+static int HandleDetach(const std::string& iface, bool egress) {
+    if (!is_root()) { std::cerr << "error: detach needs root\n"; return 1; }
+    return cmd_detach(iface, egress);
+}
+
+// Display packet rate and counter statistics
+static int HandleStats(XdpMaps& maps, bool watch, double interval) {
+    if (!watch) {
+        struct fw_stats s;
+        if (!maps.ReadStats(&s)) { std::cerr << "error: cannot read stats\n"; return 1; }
+        print_stats(s, 0, false);
+        return 0;
+    }
+    struct fw_stats prev, cur;
+    if (!maps.ReadStats(&prev)) { std::cerr << "error: cannot read stats\n"; return 1; }
+    for (int tick = 0; tick < 100000; ++tick) {
+        std::this_thread::sleep_for(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::duration<double>(interval)));
+        if (!maps.ReadStats(&cur)) break;
+
+        struct fw_stats d;
+        memset(&d, 0, sizeof(d));
+        d.pass = cur.pass - prev.pass;
+        d.bytes = cur.bytes - prev.bytes;
+        d.drop_blacklist = cur.drop_blacklist - prev.drop_blacklist;
+        d.drop_pps = cur.drop_pps - prev.drop_pps;
+        d.drop_syn = cur.drop_syn - prev.drop_syn;
+        d.drop_udp = cur.drop_udp - prev.drop_udp;
+        d.drop_icmp = cur.drop_icmp - prev.drop_icmp;
+        d.drop_malformed = cur.drop_malformed - prev.drop_malformed;
+        d.auto_bans = cur.auto_bans;
+
+        printf("\033[H\033[J");
+        std::cout << "femboi-firewall-xdp live (" << interval << "s)\n\n";
+        print_stats(d, interval, true);
+        std::cout << "\nblacklist size: " << maps.BlacklistCount() << "\n";
+        fflush(stdout);
+        prev = cur;
+    }
+    return 0;
+}
+
+// Handle IP block, unblock, and listing operations
+static int HandleIpRules(const std::string& command, XdpMaps& maps, const std::vector<std::string>& rest, size_t limit) {
+    std::string err;
+    if (command == "block") {
+        if (rest.empty()) { std::cerr << "usage: femboi-firewall-xdp block <ip> [secs]\n"; return 2; }
+        uint32_t ip = 0;
+        if (!ParseIp(rest[0], &ip)) { std::cerr << "error: bad IPv4 address\n"; return 2; }
+        const uint64_t ttl = rest.size() > 1 ? strtoull(rest[1].c_str(), nullptr, 10) : 0;
+        if (!maps.BlockIp(ip, ttl, FW_BAN_MANUAL, &err)) {
+            std::cerr << "error: " << err << "\n";
+            return 1;
+        }
+        std::cout << "[+] " << rest[0] << " blacklisted"
+                  << (ttl ? " for " + std::to_string(ttl) + "s" : " permanently") << "\n";
+        return 0;
+    }
+    if (command == "unblock") {
+        if (rest.empty()) { std::cerr << "usage: femboi-firewall-xdp unblock <ip>\n"; return 2; }
+        uint32_t ip = 0;
+        if (!ParseIp(rest[0], &ip)) { std::cerr << "error: bad IPv4 address\n"; return 2; }
+        if (!maps.UnblockIp(ip, &err)) { std::cerr << "error: " << err << "\n"; return 1; }
+        std::cout << "[+] " << rest[0] << " unblocked\n";
+        return 0;
+    }
+    if (command == "list-blocked") {
+        const auto rows = maps.ListBlocked(limit);
+        if (rows.empty()) { std::cout << "(blacklist empty)\n"; return 0; }
+
+        const uint64_t now = bpf_sys::monotonic_ns();
+        std::cout << "ip                remaining    reason      hits\n";
+        std::cout << "------------------------------------------------------\n";
+        for (const auto& r : rows) {
+            std::string rem = "permanent";
+            if (r.expires_ns) {
+                const int64_t left = (int64_t)(r.expires_ns - now);
+                rem = left > 0 ? std::to_string(left / 1000000000) + "s" : "expiring";
+            }
+            char row[160];
+            snprintf(row, sizeof(row), "%-17s %-12s %-11s %u",
+                     FormatIp(r.ip_nbo).c_str(), rem.c_str(),
+                     reason_name(r.reason), r.hits);
+            std::cout << row << "\n";
+        }
+        std::cout << "------------------------------------------------------\n"
+                  << rows.size() << " entries\n";
+        return 0;
+    }
+    if (command == "allow" || command == "disallow") {
+        if (rest.empty()) { std::cerr << "error: " << command << " needs an IP\n"; return 2; }
+        uint32_t ip = 0;
+        if (!ParseIp(rest[0], &ip)) { std::cerr << "error: bad IPv4 address\n"; return 2; }
+        const bool ok = (command == "allow") ? maps.AllowIp(ip) : maps.DisallowIp(ip);
+        if (!ok) { std::cerr << "error: map update failed\n"; return 1; }
+        std::cout << "[+] " << rest[0]
+                  << (command == "allow" ? " whitelisted" : " removed from whitelist") << "\n";
+        return 0;
+    }
+    if (command == "list-allowed") {
+        const auto rows = maps.ListAllowed(limit);
+        if (rows.empty()) { std::cout << "(whitelist empty)\n"; return 0; }
+        for (uint32_t ip : rows) std::cout << FormatIp(ip) << "\n";
+        return 0;
+    }
+    if (command == "flush") {
+        if (!maps.FlushBlacklist()) { std::cerr << "error: flush failed\n"; return 1; }
+        std::cout << "[+] blacklist flushed\n";
+        return 0;
+    }
+    return 2;
+}
+
+// Handle port class configurations
+static int HandlePorts(const std::string& command, XdpMaps& maps, const std::vector<std::string>& rest) {
+    if (command == "port") {
+        if (rest.size() < 2) { std::cerr << "usage: femboi-firewall-xdp port <n> <game|web|system|off>\n"; return 2; }
+        const long port = strtol(rest[0].c_str(), nullptr, 10);
+        if (port <= 0 || port > 65535) { std::cerr << "error: port must be 1..65535\n"; return 2; }
+
+        uint8_t cls = FW_PORT_UNPROTECTED;
+        if (rest[1] == "game") cls = FW_PORT_GAME;
+        else if (rest[1] == "web") cls = FW_PORT_WEB;
+        else if (rest[1] == "system") cls = FW_PORT_SYSTEM;
+        else if (rest[1] != "off") {
+            std::cerr << "error: invalid port class\n";
+            return 2;
+        }
+        if (!maps.SetPortClass((uint16_t)port, cls)) {
+            std::cerr << "error: cannot update port_class\n";
+            return 1;
+        }
+        std::cout << "[+] port " << port << " -> " << port_class_name(cls) << "\n";
+        return 0;
+    }
+    if (command == "ports") {
+        std::cout << "port   class\n----------------\n";
+        for (uint32_t p = 1; p <= 65535; ++p) {
+            uint8_t cls = 0;
+            if (maps.GetPortClass((uint16_t)p, &cls) && cls != FW_PORT_UNPROTECTED) {
+                printf("%-6u %s\n", p, port_class_name(cls));
+            }
+        }
+        return 0;
+    }
+    return 2;
+}
+
+// Handle runtime configuration flags
+static int HandleConfig(XdpMaps& maps, const std::vector<std::string>& rest) {
+    std::string err;
+    struct fw_config c;
+    if (!load_cfg(maps, &c, &err)) { std::cerr << "error: " << err << "\n"; return 1; }
+
+    bool changed = false;
+    size_t opt_idx = 0;
+    while (opt_idx < rest.size()) {
+        const std::string& a = rest[opt_idx];
+        auto val = [&](const char* what) -> std::string {
+            if (opt_idx + 1 >= rest.size()) { std::cerr << "error: " << what << " needs a value\n"; exit(2); }
+            return rest[++opt_idx];
+        };
+        if (a == "--pps") { c.pps_limit = (uint32_t)strtoul(val("--pps").c_str(), nullptr, 10); changed = true; }
+        else if (a == "--syn") { c.syn_limit = (uint32_t)strtoul(val("--syn").c_str(), nullptr, 10); changed = true; }
+        else if (a == "--udp") { c.udp_limit = (uint32_t)strtoul(val("--udp").c_str(), nullptr, 10); changed = true; }
+        else if (a == "--icmp") { c.icmp_limit = (uint32_t)strtoul(val("--icmp").c_str(), nullptr, 10); changed = true; }
+        else if (a == "--ban-secs") { c.ban_time_ns = strtoull(val("--ban-secs").c_str(), nullptr, 10) * 1000000000ull; changed = true; }
+        else if (a == "--window-ms") { c.window_ns = strtoull(val("--window-ms").c_str(), nullptr, 10) * 1000000ull; changed = true; }
+        else if (a == "--auto-ban") {
+            const bool on = val("--auto-ban") != "off";
+            if (on) c.flags |= FW_FLAG_AUTO_BAN; else c.flags &= ~FW_FLAG_AUTO_BAN;
+            changed = true;
+        }
+        else if (a == "--icmp-filter") {
+            const bool on = val("--icmp-filter") != "off";
+            if (on) c.flags |= FW_FLAG_ICMP_ENABLED; else c.flags &= ~FW_FLAG_ICMP_ENABLED;
+            changed = true;
+        }
+        else if (a == "--enable") { c.enabled = 1; changed = true; }
+        else if (a == "--disable") { c.enabled = 0; changed = true; }
+        else if (a == "--show") { /* display at end */ }
+        else { std::cerr << "error: unknown config flag " << a << "\n"; return 2; }
+        ++opt_idx;
+    }
+
+    if (changed && !maps.SetConfig(c)) {
+        std::cerr << "error: cannot write fw_cfg\n";
+        return 1;
+    }
+
+    if (changed) std::cout << "[+] configuration updated\n";
+    std::cout << "enabled      : " << (c.enabled ? "yes" : "no") << "\n"
+              << "pps_limit    : " << c.pps_limit << " pps/source\n"
+              << "syn_limit    : " << c.syn_limit << " SYN/source\n"
+              << "udp_limit    : " << c.udp_limit << " UDP pkt/source\n"
+              << "icmp_limit   : " << c.icmp_limit << " ICMP/source\n"
+              << "window       : " << (c.window_ns / 1000000ull) << " ms\n"
+              << "ban_time     : " << (c.ban_time_ns / 1000000000ull) << " s\n"
+              << "auto_ban     : " << ((c.flags & FW_FLAG_AUTO_BAN) ? "yes" : "no") << "\n"
+              << "icmp_filter  : " << ((c.flags & FW_FLAG_ICMP_ENABLED) ? "allow+limit" : "drop all") << "\n";
+    return 0;
+}
+
+// Program entrypoint for XDP control
 int main(int argc, char** argv) {
     std::string command;
     std::vector<std::string> rest;
@@ -258,56 +501,9 @@ int main(int argc, char** argv) {
     if (command.empty()) { usage(); return 2; }
     if (iface.empty()) iface = default_iface();
 
-    if (command == "doctor") {
-        int bad = 0;
-        std::cout << "femboi-firewall-xdp doctor\n--------------------------\n";
-
-        if (is_root()) std::cout << "[ok]   root\n";
-        else { std::cout << "[FAIL] not root\n"; bad++; }
-
-        struct stat st{};
-        if (stat("/sys/fs/bpf", &st) == 0)
-            std::cout << "[ok]   bpffs mounted\n";
-        else { std::cout << "[FAIL] /sys/fs/bpf missing\n"; bad++; }
-
-        std::string out, err;
-        if (run_argv({"bpftool", "version"}, &out, &err))
-            std::cout << "[ok]   " << out.substr(0, out.find('\n')) << "\n";
-        else { std::cout << "[FAIL] bpftool not found\n"; bad++; }
-
-        if (run_argv({"ip", "-V"}, &out, &err))
-            std::cout << "[ok]   " << out.substr(0, out.find('\n')) << "\n";
-        else { std::cout << "[FAIL] iproute2 not found\n"; bad++; }
-
-        std::cout << "[info] default interface: " << iface << "\n";
-        std::cout << "[info] pin dir:           " << pin_dir << "\n";
-
-        std::cout << "--------------------------\n";
-        std::cout << (bad ? std::to_string(bad) + " problem(s) found\n"
-                          : "Ready to attach.\n");
-        return bad ? 1 : 0;
-    }
-
-    if (command == "attach") {
-        if (!is_root()) { std::cerr << "error: attach needs root\n"; return 1; }
-        mkdir("/sys/fs/bpf", 0755);
-        mkdir(pin_dir.c_str(), 0700);
-        std::string err;
-        const int rc = cmd_attach(iface, mode, obj, egress, &err);
-        if (rc != 0) { std::cerr << "error: " << err << "\n"; return rc; }
-
-        XdpMaps maps;
-        if (maps.Open(pin_dir, &err)) {
-            seed_defaults(maps);
-        } else {
-            std::cerr << "warning: maps not open (" << err << ")\n";
-        }
-        return rc;
-    }
-    if (command == "detach") {
-        if (!is_root()) { std::cerr << "error: detach needs root\n"; return 1; }
-        return cmd_detach(iface, egress);
-    }
+    if (command == "doctor") return HandleDoctor(iface, pin_dir);
+    if (command == "attach") return HandleAttach(iface, mode, obj, egress, pin_dir);
+    if (command == "detach") return HandleDetach(iface, egress);
 
     XdpMaps maps;
     std::string err;
@@ -316,196 +512,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (command == "block") {
-        if (rest.empty()) { std::cerr << "usage: femboi-firewall-xdp block <ip> [secs]\n"; return 2; }
-        uint32_t ip = 0;
-        if (!ParseIp(rest[0], &ip)) { std::cerr << "error: bad IPv4 address\n"; return 2; }
-        const uint64_t ttl = rest.size() > 1 ? strtoull(rest[1].c_str(), nullptr, 10) : 0;
-        if (!maps.BlockIp(ip, ttl, FW_BAN_MANUAL, &err)) {
-            std::cerr << "error: " << err << "\n";
-            return 1;
-        }
-        std::cout << "[+] " << rest[0] << " blacklisted"
-                  << (ttl ? " for " + std::to_string(ttl) + "s" : " permanently") << "\n";
-        return 0;
-    }
-
-    if (command == "unblock") {
-        if (rest.empty()) { std::cerr << "usage: femboi-firewall-xdp unblock <ip>\n"; return 2; }
-        uint32_t ip = 0;
-        if (!ParseIp(rest[0], &ip)) { std::cerr << "error: bad IPv4 address\n"; return 2; }
-        if (!maps.UnblockIp(ip, &err)) { std::cerr << "error: " << err << "\n"; return 1; }
-        std::cout << "[+] " << rest[0] << " unblocked\n";
-        return 0;
-    }
-
-    if (command == "list-blocked") {
-        const auto rows = maps.ListBlocked(limit);
-        if (rows.empty()) { std::cout << "(blacklist empty)\n"; return 0; }
-
-        const uint64_t now = bpf_sys::monotonic_ns();
-        std::cout << "ip                remaining    reason      hits\n";
-        std::cout << "------------------------------------------------------\n";
-        for (const auto& r : rows) {
-            std::string rem = "permanent";
-            if (r.expires_ns) {
-                const int64_t left = (int64_t)(r.expires_ns - now);
-                rem = left > 0 ? std::to_string(left / 1000000000) + "s" : "expiring";
-            }
-            char row[160];
-            snprintf(row, sizeof(row), "%-17s %-12s %-11s %u",
-                     FormatIp(r.ip_nbo).c_str(), rem.c_str(),
-                     reason_name(r.reason), r.hits);
-            std::cout << row << "\n";
-        }
-        std::cout << "------------------------------------------------------\n"
-                  << rows.size() << " entries\n";
-        return 0;
-    }
-
-    if (command == "allow" || command == "disallow") {
-        if (rest.empty()) { std::cerr << "error: " << command << " needs an IP\n"; return 2; }
-        uint32_t ip = 0;
-        if (!ParseIp(rest[0], &ip)) { std::cerr << "error: bad IPv4 address\n"; return 2; }
-        const bool ok = (command == "allow") ? maps.AllowIp(ip) : maps.DisallowIp(ip);
-        if (!ok) { std::cerr << "error: map update failed\n"; return 1; }
-        std::cout << "[+] " << rest[0]
-                  << (command == "allow" ? " whitelisted" : " removed from whitelist") << "\n";
-        return 0;
-    }
-
-    if (command == "list-allowed") {
-        const auto rows = maps.ListAllowed(limit);
-        if (rows.empty()) { std::cout << "(whitelist empty)\n"; return 0; }
-        for (uint32_t ip : rows) std::cout << FormatIp(ip) << "\n";
-        return 0;
-    }
-
-    if (command == "flush") {
-        if (!maps.FlushBlacklist()) { std::cerr << "error: flush failed\n"; return 1; }
-        std::cout << "[+] blacklist flushed\n";
-        return 0;
-    }
-
-    if (command == "stats") {
-        if (!watch) {
-            struct fw_stats s;
-            if (!maps.ReadStats(&s)) { std::cerr << "error: cannot read stats\n"; return 1; }
-            print_stats(s, 0, false);
-            return 0;
-        }
-        struct fw_stats prev, cur;
-        if (!maps.ReadStats(&prev)) { std::cerr << "error: cannot read stats\n"; return 1; }
-        for (int tick = 0; tick < 100000; ++tick) {
-            std::this_thread::sleep_for(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::duration<double>(interval)));
-            if (!maps.ReadStats(&cur)) break;
-
-            struct fw_stats d;
-            memset(&d, 0, sizeof(d));
-            d.pass = cur.pass - prev.pass;
-            d.bytes = cur.bytes - prev.bytes;
-            d.drop_blacklist = cur.drop_blacklist - prev.drop_blacklist;
-            d.drop_pps = cur.drop_pps - prev.drop_pps;
-            d.drop_syn = cur.drop_syn - prev.drop_syn;
-            d.drop_udp = cur.drop_udp - prev.drop_udp;
-            d.drop_icmp = cur.drop_icmp - prev.drop_icmp;
-            d.drop_malformed = cur.drop_malformed - prev.drop_malformed;
-            d.auto_bans = cur.auto_bans;
-
-            printf("\033[H\033[J");
-            std::cout << "femboi-firewall-xdp live (" << interval << "s)\n\n";
-            print_stats(d, interval, true);
-            std::cout << "\nblacklist size: " << maps.BlacklistCount() << "\n";
-            fflush(stdout);
-            prev = cur;
-        }
-        return 0;
-    }
-
-    if (command == "port") {
-        if (rest.size() < 2) { std::cerr << "usage: femboi-firewall-xdp port <n> <game|web|system|off>\n"; return 2; }
-        const long port = strtol(rest[0].c_str(), nullptr, 10);
-        if (port <= 0 || port > 65535) { std::cerr << "error: port must be 1..65535\n"; return 2; }
-
-        uint8_t cls = FW_PORT_UNPROTECTED;
-        if (rest[1] == "game") cls = FW_PORT_GAME;
-        else if (rest[1] == "web") cls = FW_PORT_WEB;
-        else if (rest[1] == "system") cls = FW_PORT_SYSTEM;
-        else if (rest[1] != "off") {
-            std::cerr << "error: invalid port class\n";
-            return 2;
-        }
-        if (!maps.SetPortClass((uint16_t)port, cls)) {
-            std::cerr << "error: cannot update port_class\n";
-            return 1;
-        }
-        std::cout << "[+] port " << port << " -> " << port_class_name(cls) << "\n";
-        return 0;
-    }
-
-    if (command == "ports") {
-        std::cout << "port   class\n";
-        std::cout << "----------------\n";
-        for (uint32_t p = 1; p <= 65535; ++p) {
-            uint8_t cls = 0;
-            if (maps.GetPortClass((uint16_t)p, &cls) && cls != FW_PORT_UNPROTECTED) {
-                printf("%-6u %s\n", p, port_class_name(cls));
-            }
-        }
-        return 0;
-    }
-
-    if (command == "config") {
-        struct fw_config c;
-        if (!load_cfg(maps, &c, &err)) { std::cerr << "error: " << err << "\n"; return 1; }
-
-        bool changed = false;
-        for (size_t i = 0; i < rest.size(); ++i) {
-            const std::string& a = rest[i];
-            auto val = [&](const char* what) -> std::string {
-                if (i + 1 >= rest.size()) { std::cerr << "error: " << what << " needs a value\n"; exit(2); }
-                return rest[++i];
-            };
-            if (a == "--pps") { c.pps_limit = (uint32_t)strtoul(val("--pps").c_str(), nullptr, 10); changed = true; }
-            else if (a == "--syn") { c.syn_limit = (uint32_t)strtoul(val("--syn").c_str(), nullptr, 10); changed = true; }
-            else if (a == "--udp") { c.udp_limit = (uint32_t)strtoul(val("--udp").c_str(), nullptr, 10); changed = true; }
-            else if (a == "--icmp") { c.icmp_limit = (uint32_t)strtoul(val("--icmp").c_str(), nullptr, 10); changed = true; }
-            else if (a == "--ban-secs") { c.ban_time_ns = strtoull(val("--ban-secs").c_str(), nullptr, 10) * 1000000000ull; changed = true; }
-            else if (a == "--window-ms") { c.window_ns = strtoull(val("--window-ms").c_str(), nullptr, 10) * 1000000ull; changed = true; }
-            else if (a == "--auto-ban") {
-                const bool on = val("--auto-ban") != "off";
-                if (on) c.flags |= FW_FLAG_AUTO_BAN; else c.flags &= ~FW_FLAG_AUTO_BAN;
-                changed = true;
-            }
-            else if (a == "--icmp-filter") {
-                const bool on = val("--icmp-filter") != "off";
-                if (on) c.flags |= FW_FLAG_ICMP_ENABLED; else c.flags &= ~FW_FLAG_ICMP_ENABLED;
-                changed = true;
-            }
-            else if (a == "--enable") { c.enabled = 1; changed = true; }
-            else if (a == "--disable") { c.enabled = 0; changed = true; }
-            else if (a == "--show") { continue; }
-            else { std::cerr << "error: unknown config flag " << a << "\n"; return 2; }
-        }
-
-        if (changed && !maps.SetConfig(c)) {
-            std::cerr << "error: cannot write fw_cfg\n";
-            return 1;
-        }
-
-        if (changed) std::cout << "[+] configuration updated\n";
-        std::cout << "enabled      : " << (c.enabled ? "yes" : "no") << "\n"
-                  << "pps_limit    : " << c.pps_limit << " pps/source\n"
-                  << "syn_limit    : " << c.syn_limit << " SYN/source\n"
-                  << "udp_limit    : " << c.udp_limit << " UDP pkt/source\n"
-                  << "icmp_limit   : " << c.icmp_limit << " ICMP/source\n"
-                  << "window       : " << (c.window_ns / 1000000ull) << " ms\n"
-                  << "ban_time     : " << (c.ban_time_ns / 1000000000ull) << " s\n"
-                  << "auto_ban     : " << ((c.flags & FW_FLAG_AUTO_BAN) ? "yes" : "no") << "\n"
-                  << "icmp_filter  : " << ((c.flags & FW_FLAG_ICMP_ENABLED) ? "allow+limit" : "drop all") << "\n";
-        return 0;
+    if (command == "stats") return HandleStats(maps, watch, interval);
+    if (command == "port" || command == "ports") return HandlePorts(command, maps, rest);
+    if (command == "config") return HandleConfig(maps, rest);
+    if (command == "block" || command == "unblock" || command == "list-blocked" ||
+        command == "allow" || command == "disallow" || command == "list-allowed" || command == "flush") {
+        return HandleIpRules(command, maps, rest, limit);
     }
 
     std::cerr << "unknown command: " << command << "\n\n";

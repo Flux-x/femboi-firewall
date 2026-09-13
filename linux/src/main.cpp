@@ -664,17 +664,174 @@ int CmdSet(femboifw::Config& cfg, const std::string& config_path,
     return 0;
 }
 
-/**
- * @brief Main program entry point for the Femboi Firewall CLI and daemon.
- * 
- * Parses command line options, initializes logging, validates and loads the
- * configuration file, and dispatches to appropriate command subroutines
- * (daemon, status, apply, ports, set, doctor, ban, unban, geo, list).
- * 
- * @param argc Number of command-line arguments.
- * @param argv Array of command-line argument strings.
- * @return int 0 on success, non-zero exit code on failure.
- */
+// Validate that path contains only safe alphanumeric/path characters and no directory traversal
+bool IsSafeConfigPath(const std::string& path) {
+    if (path.empty() || path.size() > 4096) return false;
+    if (path.find('\0') != std::string::npos || path.find("..") != std::string::npos) return false;
+    for (char c : path) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) &&
+            c != '/' && c != '.' && c != '-' && c != '_' && c != '\\') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Handle administrative commands (list, ban, unban, geo)
+static int CmdAdmin(const std::string& command, const Config& cfg, const std::vector<std::string>& rest) {
+    if (geteuid() != 0) {
+        std::cerr << "error: command needs root\n";
+        return 1;
+    }
+    Nft nft;
+
+    if (command == "list") {
+        return CmdList(cfg);
+    }
+    if (command == "ban") {
+        if (rest.empty()) {
+            std::cerr << "usage: femboi-firewall ban <ip> [secs]\n";
+            return 2;
+        }
+        uint32_t ip = 0;
+        if (!ParseIp(rest[0], &ip)) {
+            std::cerr << "error: invalid IPv4 address: " << rest[0] << "\n";
+            return 2;
+        }
+        const int64_t ttl = rest.size() > 1 ? strtoll(rest[1].c_str(), nullptr, 10) : cfg.ban_seconds;
+        const std::string reason = rest.size() > 2 ? rest[2] : "manual";
+
+        std::string e2;
+        if (!nft.AddBan(ip, ttl > 0 ? (uint32_t)ttl : 0, &e2)) {
+            std::cerr << "error: nft: " << e2 << "\n";
+            return 1;
+        }
+        std::cout << "banned " << FormatIp(ip)
+                  << (ttl > 0 ? " for " + std::to_string(ttl) + "s" : " permanently")
+                  << " (" << reason << ")\n";
+        return 0;
+    }
+    if (command == "unban") {
+        if (rest.empty()) {
+            std::cerr << "usage: femboi-firewall unban <ip>\n";
+            return 2;
+        }
+        uint32_t ip = 0;
+        if (!ParseIp(rest[0], &ip)) {
+            std::cerr << "error: invalid IPv4 address: " << rest[0] << "\n";
+            return 2;
+        }
+        std::string e2;
+        nft.DelBan(ip, &e2);
+        std::cout << "unbanned " << FormatIp(ip) << "\n";
+        return 0;
+    }
+    if (command == "geo") {
+        if (rest.size() < 2) {
+            std::cerr << "usage: femboi-firewall geo <CC> <allow|block|rate|attack> [max_pps] [max_conns]\n";
+            return 2;
+        }
+        std::string cc = rest[0];
+        for (auto& c : cc) c = (char)toupper((unsigned char)c);
+        if (cc.size() != 2) {
+            std::cerr << "error: country code must be 2 letters\n";
+            return 2;
+        }
+        int action = kGeoAllow;
+        bool is_remove = false;
+        const std::string& a = rest[1];
+        if (a == "block") action = kGeoBlock;
+        else if (a == "rate") action = kGeoRateLimit;
+        else if (a == "attack") action = kGeoUnderAttack;
+        else if (a == "remove" || a == "delete") is_remove = true;
+        else if (a != "allow") {
+            std::cerr << "error: invalid geo action\n";
+            return 2;
+        }
+
+        std::map<std::string, CountryRule> rules;
+        LoadGeoRules(cfg.rules_path, rules);
+        if (is_remove) {
+            rules.erase(cc);
+        } else {
+            CountryRule r;
+            r.code = cc;
+            auto prev = rules.find(cc);
+            r.name = prev != rules.end() ? prev->second.name : cc;
+            r.action = action;
+            r.max_pps = rest.size() > 2 ? (uint32_t)strtoul(rest[2].c_str(), nullptr, 10) : 0;
+            r.max_connections = rest.size() > 3 ? (uint32_t)strtoul(rest[3].c_str(), nullptr, 10) : 0;
+            rules[cc] = r;
+        }
+
+        mkdir(cfg.state_dir.c_str(), 0700);
+        std::ofstream out(cfg.rules_path, std::ios::trunc);
+        if (!out) {
+            std::cerr << "error: cannot write " << cfg.rules_path << "\n";
+            return 1;
+        }
+        out << "[\n";
+        bool first = true;
+        for (const auto& kv : rules) {
+            if (!first) out << ",\n";
+            first = false;
+            out << "  {\n"
+                << "    \"code\": \"" << kv.second.code << "\",\n"
+                << "    \"name\": \"" << (kv.second.name.empty() ? kv.second.code : kv.second.name) << "\",\n"
+                << "    \"action\": " << kv.second.action << ",\n"
+                << "    \"max_pps\": " << kv.second.max_pps << ",\n"
+                << "    \"max_conns\": " << kv.second.max_connections << ",\n"
+                << "    \"block_udp\": " << (kv.second.block_udp ? "true" : "false") << "\n"
+                << "  }";
+        }
+        out << "\n]\n";
+        out.close();
+
+        std::cout << cc << " -> " << a << "\n";
+        return 0;
+    }
+    return 2;
+}
+
+// Dispatch core operational commands
+static int CmdDispatch(const std::string& command, const Config& cfg, const std::string& config_path, const std::vector<std::string>& rest) {
+    if (command == "apply") {
+        EngineState st;
+        st.cfg = cfg;
+        st.asn.Init();
+        st.geo.Load(cfg.geoip_path, nullptr);
+        return ApplyAll(st, true) ? 0 : 1;
+    }
+    if (command == "status") {
+        return CmdStatus(cfg, BanTable{}, false);
+    }
+    if (command == "ports") {
+        return CmdPorts(cfg);
+    }
+    if (command == "set") {
+        if (rest.size() < 2) {
+            std::cerr << "usage: femboi-firewall set <key> <value>\n";
+            return 2;
+        }
+        if (geteuid() != 0) {
+            std::cerr << "error: set needs root\n";
+            return 1;
+        }
+        return CmdSet(cfg, config_path, rest[0], rest[1]);
+    }
+    if (command == "daemon") {
+        return CmdDaemon(cfg);
+    }
+    if (command == "list" || command == "ban" || command == "unban" || command == "geo") {
+        return CmdAdmin(command, cfg, rest);
+    }
+
+    std::cerr << "unknown command: " << command << "\n\n";
+    Usage();
+    return 2;
+}
+
+// Program main entrypoint
 int main(int argc, char** argv) {
     using namespace femboifw;
 
@@ -711,16 +868,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // Sanitize config path to prevent path traversal or invalid characters
-    if (config_path.find('\0') != std::string::npos) {
-        std::cerr << "error: invalid characters in config path\n";
+    if (!IsSafeConfigPath(config_path)) {
+        std::cerr << "error: invalid characters or directory traversal in config path\n";
         return 2;
-    }
-    std::error_code ec;
-    std::filesystem::path cp(config_path);
-    auto normalized_cp = std::filesystem::weakly_canonical(cp, ec);
-    if (!ec) {
-        config_path = normalized_cp.string();
     }
 
     if (command == "doctor") return CmdDoctor();
@@ -741,150 +891,5 @@ int main(int argc, char** argv) {
         LogSetFile(kDefaultLog);
     }
 
-    if (command == "apply") {
-        EngineState st;
-        st.cfg = cfg;
-        st.asn.Init();
-        st.geo.Load(cfg.geoip_path, nullptr);
-        return ApplyAll(st, true) ? 0 : 1;
-    }
-    if (command == "status") {
-        return CmdStatus(cfg, BanTable{}, false);
-    }
-    if (command == "ports") {
-        return CmdPorts(cfg);
-    }
-    if (command == "set") {
-        if (rest.size() < 2) {
-            std::cerr << "usage: femboi-firewall set <key> <value>\n";
-            return 2;
-        }
-        if (geteuid() != 0) {
-            std::cerr << "error: set needs root\n";
-            return 1;
-        }
-        return CmdSet(cfg, config_path, rest[0], rest[1]);
-    }
-    if (command == "daemon") {
-        return CmdDaemon(cfg);
-    }
-    if (command == "list" || command == "ban" || command == "unban" ||
-        command == "geo") {
-        if (geteuid() != 0) {
-            std::cerr << "error: command needs root\n";
-            return 1;
-        }
-        Nft nft;
-
-        if (command == "list") {
-            return CmdList(cfg);
-        }
-        if (command == "ban") {
-            if (rest.empty()) {
-                std::cerr << "usage: femboi-firewall ban <ip> [secs]\n";
-                return 2;
-            }
-            uint32_t ip = 0;
-            if (!ParseIp(rest[0], &ip)) {
-                std::cerr << "error: invalid IPv4 address: " << rest[0] << "\n";
-                return 2;
-            }
-            const int64_t ttl = rest.size() > 1 ? strtoll(rest[1].c_str(), nullptr, 10) : cfg.ban_seconds;
-            const std::string reason = rest.size() > 2 ? rest[2] : "manual";
-
-            std::string e2;
-            if (!nft.AddBan(ip, ttl > 0 ? (uint32_t)ttl : 0, &e2)) {
-                std::cerr << "error: nft: " << e2 << "\n";
-                return 1;
-            }
-            std::cout << "banned " << FormatIp(ip)
-                      << (ttl > 0 ? " for " + std::to_string(ttl) + "s" : " permanently")
-                      << " (" << reason << ")\n";
-            return 0;
-        }
-        if (command == "unban") {
-            if (rest.empty()) {
-                std::cerr << "usage: femboi-firewall unban <ip>\n";
-                return 2;
-            }
-            uint32_t ip = 0;
-            if (!ParseIp(rest[0], &ip)) {
-                std::cerr << "error: invalid IPv4 address: " << rest[0] << "\n";
-                return 2;
-            }
-            std::string e2;
-            nft.DelBan(ip, &e2);
-            std::cout << "unbanned " << FormatIp(ip) << "\n";
-            return 0;
-        }
-
-        if (command == "geo") {
-            if (rest.size() < 2) {
-                std::cerr << "usage: femboi-firewall geo <CC> <allow|block|rate|attack> [max_pps] [max_conns]\n";
-                return 2;
-            }
-            std::string cc = rest[0];
-            for (auto& c : cc) c = (char)toupper((unsigned char)c);
-            if (cc.size() != 2) {
-                std::cerr << "error: country code must be 2 letters\n";
-                return 2;
-            }
-            int action = kGeoAllow;
-            bool is_remove = false;
-            const std::string& a = rest[1];
-            if (a == "block") action = kGeoBlock;
-            else if (a == "rate") action = kGeoRateLimit;
-            else if (a == "attack") action = kGeoUnderAttack;
-            else if (a == "remove" || a == "delete") is_remove = true;
-            else if (a != "allow") {
-                std::cerr << "error: invalid geo action\n";
-                return 2;
-            }
-
-            std::map<std::string, CountryRule> rules;
-            LoadGeoRules(cfg.rules_path, rules);
-            if (is_remove) {
-                rules.erase(cc);
-            } else {
-                CountryRule r;
-                r.code = cc;
-                auto prev = rules.find(cc);
-                r.name = prev != rules.end() ? prev->second.name : cc;
-                r.action = action;
-                r.max_pps = rest.size() > 2 ? (uint32_t)strtoul(rest[2].c_str(), nullptr, 10) : 0;
-                r.max_connections = rest.size() > 3 ? (uint32_t)strtoul(rest[3].c_str(), nullptr, 10) : 0;
-                rules[cc] = r;
-            }
-
-            mkdir(cfg.state_dir.c_str(), 0700);
-            std::ofstream out(cfg.rules_path, std::ios::trunc);
-            if (!out) {
-                std::cerr << "error: cannot write " << cfg.rules_path << "\n";
-                return 1;
-            }
-            out << "[\n";
-            bool first = true;
-            for (const auto& kv : rules) {
-                if (!first) out << ",\n";
-                first = false;
-                out << "  {\n"
-                    << "    \"code\": \"" << kv.second.code << "\",\n"
-                    << "    \"name\": \"" << (kv.second.name.empty() ? kv.second.code : kv.second.name) << "\",\n"
-                    << "    \"action\": " << kv.second.action << ",\n"
-                    << "    \"max_pps\": " << kv.second.max_pps << ",\n"
-                    << "    \"max_conns\": " << kv.second.max_connections << ",\n"
-                    << "    \"block_udp\": " << (kv.second.block_udp ? "true" : "false") << "\n"
-                    << "  }";
-            }
-            out << "\n]\n";
-            out.close();
-
-            std::cout << cc << " -> " << a << "\n";
-            return 0;
-        }
-    }
-
-    std::cerr << "unknown command: " << command << "\n\n";
-    Usage();
-    return 2;
+    return CmdDispatch(command, cfg, config_path, rest);
 }
