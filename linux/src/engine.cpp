@@ -231,12 +231,8 @@ bool Config::Save(const std::string& path, std::string* err) const {
 
     char resolved[PATH_MAX];
     if (realpath(path.c_str(), resolved) == nullptr) {
-        int fd = open(path.c_str(), O_WRONLY | O_CREAT, 0644);
-        if (fd >= 0) close(fd);
-        if (realpath(path.c_str(), resolved) == nullptr) {
-            if (err) *err = "cannot resolve config destination: " + path;
-            return false;
-        }
+        if (err) *err = "cannot resolve config destination: " + path;
+        return false;
     }
 
     const std::string safe_dest = resolved;
