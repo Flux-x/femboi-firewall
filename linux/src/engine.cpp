@@ -91,7 +91,13 @@ bool Config::Load(const std::string& path, std::string* err) {
         return false;
     }
 
-    std::ifstream in(path);
+    char resolved[4096];
+    std::string safe_path = path;
+    if (realpath(path.c_str(), resolved) != nullptr) {
+        safe_path = resolved;
+    }
+
+    std::ifstream in(safe_path);
     if (!in) {
         if (err) *err = "config not found: " + path;
         return false;
@@ -186,6 +192,11 @@ bool Config::Load(const std::string& path, std::string* err) {
 
 // Persist configuration to file
 bool Config::Save(const std::string& path, std::string* err) const {
+    if (path.empty() || path.find("..") != std::string::npos) {
+        if (err) *err = "invalid config path: " + path;
+        return false;
+    }
+
     const std::string tmp = path + ".tmp";
     {
         std::ofstream out(tmp, std::ios::trunc);
