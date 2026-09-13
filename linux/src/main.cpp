@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -48,21 +49,6 @@ void InstallSignals() {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGHUP, &sa, nullptr);
     signal(SIGPIPE, SIG_IGN);
-}
-
-// Copy atomic counter values
-void SnapshotCounters(const Counters& src, Counters& dst) {
-    dst.processed.store(src.processed.load());
-    dst.passed.store(src.passed.load());
-    dst.blocked_ratelimit.store(src.blocked_ratelimit.load());
-    dst.blocked_exploit.store(src.blocked_exploit.load());
-    dst.blocked_syn.store(src.blocked_syn.load());
-    dst.blocked_banned.store(src.blocked_banned.load());
-    dst.blocked_small.store(src.blocked_small.load());
-    dst.blocked_invalid.store(src.blocked_invalid.load());
-    dst.blocked_a2s.store(src.blocked_a2s.load());
-    dst.blocked_tcp.store(src.blocked_tcp.load());
-    dst.blocked_tcp_payload.store(src.blocked_tcp_payload.load());
 }
 
 // Load geo-blocking rules file
@@ -207,7 +193,9 @@ int CmdDoctor() {
         std::string out, err;
         Nft::Run({"--version"}, &out, &err);
         std::cout << "[ok]   nftables:     " << (out.empty() ? err : out.substr(0, 60));
-        if (!out.empty() && out.back() == '\n') {} else std::cout << "\n";
+        if (out.empty() || out.back() != '\n') {
+            std::cout << "\n";
+        }
     } else {
         std::cout << "[FAIL] nft not found (install nftables)\n";
         problems++;
@@ -676,7 +664,17 @@ int CmdSet(femboifw::Config& cfg, const std::string& config_path,
     return 0;
 }
 
-// Program main entrypoint
+/**
+ * @brief Main program entry point for the Femboi Firewall CLI and daemon.
+ * 
+ * Parses command line options, initializes logging, validates and loads the
+ * configuration file, and dispatches to appropriate command subroutines
+ * (daemon, status, apply, ports, set, doctor, ban, unban, geo, list).
+ * 
+ * @param argc Number of command-line arguments.
+ * @param argv Array of command-line argument strings.
+ * @return int 0 on success, non-zero exit code on failure.
+ */
 int main(int argc, char** argv) {
     using namespace femboifw;
 
@@ -684,7 +682,8 @@ int main(int argc, char** argv) {
     std::string command;
     std::vector<std::string> rest;
 
-    for (int i = 1; i < argc; ++i) {
+    int i = 1;
+    while (i < argc) {
         const std::string a = argv[i];
         if (a == "-h" || a == "--help") {
             Usage();
@@ -704,11 +703,24 @@ int main(int argc, char** argv) {
         } else {
             rest.push_back(a);
         }
+        ++i;
     }
 
     if (command.empty()) {
         Usage();
         return 2;
+    }
+
+    // Sanitize config path to prevent path traversal or invalid characters
+    if (config_path.find('\0') != std::string::npos) {
+        std::cerr << "error: invalid characters in config path\n";
+        return 2;
+    }
+    std::error_code ec;
+    std::filesystem::path cp(config_path);
+    auto normalized_cp = std::filesystem::weakly_canonical(cp, ec);
+    if (!ec) {
+        config_path = normalized_cp.string();
     }
 
     if (command == "doctor") return CmdDoctor();

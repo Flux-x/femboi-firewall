@@ -444,7 +444,7 @@ bool AsnFilter::IsDatacenter(uint32_t ip_nbo) const {
 // Add IP to ban table
 void BanTable::Add(uint32_t ip_nbo, uint16_t port, const std::string& reason,
                    int64_t duration_secs, int count, bool manual) {
-    if (duration_secs < 60) duration_secs = 60;
+    if (duration_secs > 0 && duration_secs < 60) duration_secs = 60;
 
     std::lock_guard<std::mutex> lk(mu_);
     const int64_t now = NowEpoch();

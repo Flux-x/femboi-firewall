@@ -210,7 +210,17 @@ void seed_defaults(const XdpMaps& m) {
 
 } // namespace
 
-// Program entrypoint for XDP control
+/**
+ * @brief Entrypoint for the XDP control utility (femboi-firewall-xdp).
+ * 
+ * Manages eBPF XDP datapath operations including program attachment,
+ * detachment, BPF map inspection, real-time telemetry counters,
+ * whitelist/blacklist manipulation, and configuration synchronization.
+ * 
+ * @param argc Number of command-line arguments.
+ * @param argv Array of command-line argument strings.
+ * @return int 0 on success, non-zero error code on failure.
+ */
 int main(int argc, char** argv) {
     std::string command;
     std::vector<std::string> rest;
@@ -220,7 +230,8 @@ int main(int argc, char** argv) {
     double interval = 1.0;
     size_t limit = 500;
 
-    for (int i = 1; i < argc; ++i) {
+    int i = 1;
+    while (i < argc) {
         const std::string a = argv[i];
         auto need = [&](const char* what) -> std::string {
             if (i + 1 >= argc) {
@@ -241,6 +252,7 @@ int main(int argc, char** argv) {
         else if (a == "--limit") limit = (size_t)strtoul(need("--limit").c_str(), nullptr, 10);
         else if (command.empty()) command = a;
         else rest.push_back(a);
+        ++i;
     }
 
     if (command.empty()) { usage(); return 2; }
@@ -474,7 +486,7 @@ int main(int argc, char** argv) {
             }
             else if (a == "--enable") { c.enabled = 1; changed = true; }
             else if (a == "--disable") { c.enabled = 0; changed = true; }
-            else if (a == "--show") { }
+            else if (a == "--show") { continue; }
             else { std::cerr << "error: unknown config flag " << a << "\n"; return 2; }
         }
 
