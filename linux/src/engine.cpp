@@ -3,6 +3,9 @@
 #include "fw_portable.hpp"
 
 #include <arpa/inet.h>
+#include <climits>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -80,9 +83,74 @@ std::string trim(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
+/**
+ * @brief Parse comma-separated list of ports into PortSlot vector.
+ * @param ports Output vector of PortSlot entries.
+ * @param val Comma-separated port definitions.
+ */
+void ParsePorts(std::vector<PortSlot>& ports, const std::string& val) {
+    ports.assign(kMaxPorts, PortSlot{});
+    std::stringstream ss(val);
+    std::string item;
+    int idx = 0;
+    while (std::getline(ss, item, ',') && idx < kMaxPorts) {
+        item = trim(item);
+        if (item.empty()) continue;
+        uint16_t p = 0;
+        std::string proto = "both";
+        size_t slash = item.find('/');
+        std::string port_part = slash == std::string::npos ? item : item.substr(0, slash);
+        if (slash != std::string::npos) proto = trim(item.substr(slash + 1));
+
+        char* end = nullptr;
+        long n = strtol(port_part.c_str(), &end, 10);
+        if (end == port_part.c_str() || n <= 0 || n > 65535) continue;
+        p = (uint16_t)n;
+
+        PortSlot& s = ports[idx++];
+        s.port = p;
+        s.enabled = true;
+        s.type = port_auto_classify(p);
+        s.rate_limit = 100;
+        s.speed_mbps = 10000;
+        if (proto == "tcp") s.proto = kProtoTcp;
+        else if (proto == "udp") s.proto = kProtoUdp;
+        else s.proto = kProtoBoth;
+    }
+}
+
+/**
+ * @brief Parse individual key-value configuration pair into Config object.
+ * @param cfg Configuration structure to update.
+ * @param key Configuration setting name.
+ * @param val Configuration setting value.
+ */
+void ParseKeyValue(Config& cfg, const std::string& key, const std::string& val) {
+    if (key == "enabled") cfg.enabled = (val == "1" || val == "true" || val == "yes");
+    else if (key == "datacenter_filter") cfg.datacenter_filter = (val != "0" && val != "false");
+    else if (key == "geo_enabled") cfg.geo_enabled = (val != "0" && val != "false");
+    else if (key == "cti_enabled") cfg.cti_enabled = (val != "0" && val != "false");
+    else if (key == "auto_ban") cfg.auto_ban = (val != "0" && val != "false");
+    else if (key == "ban_seconds") cfg.ban_seconds = (uint32_t)strtoul(val.c_str(), nullptr, 10);
+    else if (key == "per_ip_pps") cfg.per_ip_pps = (uint32_t)strtoul(val.c_str(), nullptr, 10);
+    else if (key == "rate_burst") cfg.rate_burst = (uint32_t)strtoul(val.c_str(), nullptr, 10);
+    else if (key == "dpi_enabled") cfg.dpi_enabled = (val != "0" && val != "false");
+    else if (key == "dpi_queue") cfg.dpi_queue = (uint16_t)strtoul(val.c_str(), nullptr, 10);
+    else if (key == "xdp_enabled") cfg.xdp_enabled = (val != "0" && val != "false");
+    else if (key == "xdp_pin_dir") cfg.xdp_pin_dir = val;
+    else if (key == "geoip_path") cfg.geoip_path = val;
+    else if (key == "rules_path") cfg.rules_path = val;
+    else if (key == "state_dir") cfg.state_dir = val;
+}
+
 } // namespace
 
-// Load configuration from file
+/**
+ * @brief Load firewall configuration from the specified file path.
+ * @param path Canonical or absolute filesystem path to configuration file.
+ * @param err Optional pointer to receive descriptive error message on failure.
+ * @return True if configuration was successfully loaded and parsed, false otherwise.
+ */
 bool Config::Load(const std::string& path, std::string* err) {
     ApplyDefaults();
 
@@ -91,15 +159,15 @@ bool Config::Load(const std::string& path, std::string* err) {
         return false;
     }
 
-    char resolved[4096];
-    std::string safe_path = path;
-    if (realpath(path.c_str(), resolved) != nullptr) {
-        safe_path = resolved;
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved) == nullptr) {
+        if (err) *err = "config not found: " + path;
+        return false;
     }
 
-    std::ifstream in(safe_path);
+    std::ifstream in(resolved);
     if (!in) {
-        if (err) *err = "config not found: " + path;
+        if (err) *err = "cannot open config file: " + std::string(resolved);
         return false;
     }
 
@@ -118,34 +186,7 @@ bool Config::Load(const std::string& path, std::string* err) {
 
         if (key == "ports") {
             saw_ports = true;
-            ports.assign(kMaxPorts, PortSlot{});
-            std::stringstream ss(val);
-            std::string item;
-            int idx = 0;
-            while (std::getline(ss, item, ',') && idx < kMaxPorts) {
-                item = trim(item);
-                if (item.empty()) continue;
-                uint16_t p = 0;
-                std::string proto = "both";
-                size_t slash = item.find('/');
-                std::string port_part = slash == std::string::npos ? item : item.substr(0, slash);
-                if (slash != std::string::npos) proto = trim(item.substr(slash + 1));
-
-                char* end = nullptr;
-                long n = strtol(port_part.c_str(), &end, 10);
-                if (end == port_part.c_str() || n <= 0 || n > 65535) continue;
-                p = (uint16_t)n;
-
-                PortSlot& s = ports[idx++];
-                s.port = p;
-                s.enabled = true;
-                s.type = port_auto_classify(p);
-                s.rate_limit = 100;
-                s.speed_mbps = 10000;
-                if (proto == "tcp") s.proto = kProtoTcp;
-                else if (proto == "udp") s.proto = kProtoUdp;
-                else s.proto = kProtoBoth;
-            }
+            ParsePorts(ports, val);
             continue;
         }
 
@@ -168,21 +209,7 @@ bool Config::Load(const std::string& path, std::string* err) {
             continue;
         }
 
-        if (key == "enabled") enabled = (val == "1" || val == "true" || val == "yes");
-        else if (key == "datacenter_filter") datacenter_filter = (val != "0" && val != "false");
-        else if (key == "geo_enabled") geo_enabled = (val != "0" && val != "false");
-        else if (key == "cti_enabled") cti_enabled = (val != "0" && val != "false");
-        else if (key == "auto_ban") auto_ban = (val != "0" && val != "false");
-        else if (key == "ban_seconds") ban_seconds = (uint32_t)strtoul(val.c_str(), nullptr, 10);
-        else if (key == "per_ip_pps") per_ip_pps = (uint32_t)strtoul(val.c_str(), nullptr, 10);
-        else if (key == "rate_burst") rate_burst = (uint32_t)strtoul(val.c_str(), nullptr, 10);
-        else if (key == "dpi_enabled") dpi_enabled = (val != "0" && val != "false");
-        else if (key == "dpi_queue") dpi_queue = (uint16_t)strtoul(val.c_str(), nullptr, 10);
-        else if (key == "xdp_enabled") xdp_enabled = (val != "0" && val != "false");
-        else if (key == "xdp_pin_dir") xdp_pin_dir = val;
-        else if (key == "geoip_path") geoip_path = val;
-        else if (key == "rules_path") rules_path = val;
-        else if (key == "state_dir") state_dir = val;
+        ParseKeyValue(*this, key, val);
     }
 
     if (ban_seconds < 60) ban_seconds = 60;
@@ -190,14 +217,30 @@ bool Config::Load(const std::string& path, std::string* err) {
     return true;
 }
 
-// Persist configuration to file
+/**
+ * @brief Persist configuration to file.
+ * @param path Destination configuration path.
+ * @param err Output error string pointer.
+ * @return True on success, false on error.
+ */
 bool Config::Save(const std::string& path, std::string* err) const {
     if (path.empty() || path.find("..") != std::string::npos) {
         if (err) *err = "invalid config path: " + path;
         return false;
     }
 
-    const std::string tmp = path + ".tmp";
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved) == nullptr) {
+        int fd = open(path.c_str(), O_WRONLY | O_CREAT, 0644);
+        if (fd >= 0) close(fd);
+        if (realpath(path.c_str(), resolved) == nullptr) {
+            if (err) *err = "cannot resolve config destination: " + path;
+            return false;
+        }
+    }
+
+    const std::string safe_dest = resolved;
+    const std::string tmp = safe_dest + ".tmp";
     {
         std::ofstream out(tmp, std::ios::trunc);
         if (!out) {

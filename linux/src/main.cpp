@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -902,8 +903,13 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    char resolved_cfg[4096];
-    if (realpath(config_path.c_str(), resolved_cfg) != nullptr) {
+    char resolved_cfg[PATH_MAX];
+    if (realpath(config_path.c_str(), resolved_cfg) == nullptr) {
+        if (config_path != kDefaultConfig) {
+            std::cerr << "error: config file not found or inaccessible: " << config_path << "\n";
+            return 2;
+        }
+    } else {
         config_path = resolved_cfg;
     }
 
