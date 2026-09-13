@@ -1,6 +1,7 @@
 // Femboi Firewall daemon and CLI
 #include "fw.hpp"
 #include "fw_portable.hpp"
+#include "proc.hpp"
 #include "../xdp/xdp_maps.hpp"
 
 #include <sys/types.h>
@@ -609,10 +610,9 @@ int CmdDaemon(Config& cfg) {
 }
 
 } // namespace
-} // namespace femboifw
 
 // Update configuration setting from CLI
-int CmdSet(femboifw::Config& cfg, const std::string& config_path,
+int CmdSet(Config& cfg, const std::string& config_path,
            const std::string& key, const std::string& value) {
     auto parse_bool = [&](bool* out) {
         if (value == "1" || value == "on" || value == "true" || value == "yes") { *out = true; return true; }
@@ -656,7 +656,7 @@ int CmdSet(femboifw::Config& cfg, const std::string& config_path,
     std::cout << key << "=" << value << "\n";
 
     std::string out, e;
-    if (femboifw::run_argv({"systemctl", "reload", "femboi-firewall"}, &out, &e)) {
+    if (run_argv({"systemctl", "reload", "femboi-firewall"}, &out, &e)) {
         std::cout << "reloaded\n";
     } else {
         std::cout << "saved\n";
@@ -678,7 +678,7 @@ bool IsSafeConfigPath(const std::string& path) {
 }
 
 // Handle administrative commands (list, ban, unban, geo)
-static int CmdAdmin(const std::string& command, const Config& cfg, const std::vector<std::string>& rest) {
+int CmdAdmin(const std::string& command, const Config& cfg, const std::vector<std::string>& rest) {
     if (geteuid() != 0) {
         std::cerr << "error: command needs root\n";
         return 1;
@@ -794,7 +794,7 @@ static int CmdAdmin(const std::string& command, const Config& cfg, const std::ve
 }
 
 // Dispatch core operational commands
-static int CmdDispatch(const std::string& command, const Config& cfg, const std::string& config_path, const std::vector<std::string>& rest) {
+int CmdDispatch(const std::string& command, Config& cfg, const std::string& config_path, const std::vector<std::string>& rest) {
     if (command == "apply") {
         EngineState st;
         st.cfg = cfg;
@@ -830,6 +830,8 @@ static int CmdDispatch(const std::string& command, const Config& cfg, const std:
     Usage();
     return 2;
 }
+
+} // namespace femboifw
 
 // Program main entrypoint
 int main(int argc, char** argv) {
