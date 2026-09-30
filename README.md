@@ -11,13 +11,44 @@ Linux firewall for game servers (Source Engine, CS2, Rust) combining eBPF/XDP pa
 
 ---
 
-## User Interface
+## Interface
 
-- **Telemetry & Traffic Graphs**: Real-time ingress bandwidth, mitigation rates, drop stats, and live attack logs.
-- **Port Quotas & Protocol Rules**: Per-port bandwidth caps, UDP/TCP protocol separation, and rate limit budgets.
-- **Active Ban Management**: Dynamic blacklist decay timers and instant manual unbans.
-- **GeoIP Access Policies**: In-memory binary trie country filtering (`geoip.dat`).
-- **Engine Settings**: Runtime toggles for XDP datapath, L7 DPI, ASN filters, and burst thresholds.
+<div align="center">
+
+### Telemetry & Live Traffic
+<sub>Real-time ingress bandwidth, mitigation rates, drop stats, and live attack logs.</sub>
+<br><br>
+<img src="assets/overview.png" alt="Overview Tab" width="880" />
+
+<br><br>
+
+### Port Quotas & Protocol Rules
+<sub>Per-port bandwidth caps, UDP/TCP protocol separation, and rate limit budgets.</sub>
+<br><br>
+<img src="assets/ports.png" alt="Ports Tab" width="880" />
+
+<br><br>
+
+### Active Ban Sets
+<sub>Dynamic blacklist decay timers and instant manual unbans.</sub>
+<br><br>
+<img src="assets/bans.png" alt="Bans Tab" width="880" />
+
+<br><br>
+
+### GeoIP Access Policies
+<sub>In-memory binary trie country filtering (`geoip.dat`).</sub>
+<br><br>
+<img src="assets/geo.png" alt="Geo Tab" width="880" />
+
+<br><br>
+
+### Engine Settings & Modules
+<sub>Runtime toggles for XDP datapath, L7 DPI, ASN filters, and burst thresholds.</sub>
+<br><br>
+<img src="assets/settings.png" alt="Settings Tab" width="880" />
+
+</div>
 
 ---
 
