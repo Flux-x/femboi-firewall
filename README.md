@@ -1,12 +1,13 @@
 # femboi-firewall
 
-Multi-tier DDoS mitigation engine and Dear ImGui control panel for Linux game servers (Source Engine, CS2, Rust) and web services.
+Linux firewall for game servers (Source Engine, CS2, Rust) combining eBPF/XDP packet filtering, nftables rulesets, and an optional ImGui panel.
 
-Traffic filtering is executed across three dedicated layers:
-- **L3/L4 Wire-Speed Filtering (XDP)**: Kernel driver-level packet drop before socket buffer (`sk_buff`) allocation.
-- **Stateful Network Policy (nftables)**: Dynamic ban sets, GeoIP routing, datacenter/ASN filters, and per-port token buckets.
-- **Application Layer DPI (nfqueue)**: Deep packet inspection for Steam A2S query floods, malformed packets, and HTTP scanner signatures.
-- **Operator GUI (Dear ImGui)**: Desktop administration interface built on OpenGL3/GLFW.
+## Filtering Layers
+
+- **XDP (eBPF)**: Early packet drops at the driver level before reaching the network stack.
+- **nftables**: Rate limiting, dynamic IP bans, GeoIP filtering, and port rules.
+- **L7 DPI (nfqueue)**: Inspection for game query floods (A2S_INFO) and malformed payloads.
+- **ImGui GUI**: Optional desktop panel to monitor traffic and manage rules.
 
 ---
 
