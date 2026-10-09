@@ -13,8 +13,12 @@
 #ifndef ETH_P_IPV6
 #define ETH_P_IPV6 0x86DD
 #endif
-#ifndef IPPROTO_ICMPV6
-#define IPPROTO_ICMPV6 58
+// Deliberately NOT named IPPROTO_ICMPV6: glibc's <netinet/in.h> exposes it as
+// an *enum member* (not a macro), so a `#ifndef IPPROTO_ICMPV6` guard here
+// would still define the macro and then rewrite that enum, breaking every
+// userspace translation unit that includes netinet/in.h (e.g. xdpctl.cpp).
+#ifndef FW_IPPROTO_ICMPV6
+#define FW_IPPROTO_ICMPV6 58
 #endif
 
 // 802.1Q / 802.1ad tags (VLAN walking in the datapath).

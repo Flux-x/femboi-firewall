@@ -189,7 +189,7 @@ static __always_inline int handle_ipv6(void *nh, void *data_end,
 	if ((void *)(ip6 + 1) > data_end)
 		return XDP_PASS;
 
-	if (ip6->nexthdr == IPPROTO_ICMPV6) {
+	if (ip6->nexthdr == FW_IPPROTO_ICMPV6) {
 		__u8 *icmp6 = (void *)(ip6 + 1);
 		if ((void *)icmp6 + 2 <= data_end) {
 			const __u8 t = icmp6[0];
