@@ -131,10 +131,12 @@ void ParseKeyValue(Config& cfg, const std::string& key, const std::string& val) 
     if (key == "enabled") cfg.enabled = (val == "1" || val == "true" || val == "yes");
     else if (key == "datacenter_filter") cfg.datacenter_filter = (val != "0" && val != "false");
     else if (key == "geo_enabled") cfg.geo_enabled = (val != "0" && val != "false");
+    else if (key == "ipv6_enabled") cfg.ipv6_enabled = (val != "0" && val != "false");
     else if (key == "auto_ban") cfg.auto_ban = (val != "0" && val != "false");
     else if (key == "ban_seconds") cfg.ban_seconds = (uint32_t)strtoul(val.c_str(), nullptr, 10);
     else if (key == "per_ip_pps") cfg.per_ip_pps = (uint32_t)strtoul(val.c_str(), nullptr, 10);
     else if (key == "rate_burst") cfg.rate_burst = (uint32_t)strtoul(val.c_str(), nullptr, 10);
+    else if (key == "egress_udp_pps") cfg.egress_udp_pps = (uint32_t)strtoul(val.c_str(), nullptr, 10);
     else if (key == "dpi_enabled") cfg.dpi_enabled = (val != "0" && val != "false");
     else if (key == "dpi_queue") cfg.dpi_queue = (uint16_t)strtoul(val.c_str(), nullptr, 10);
     else if (key == "xdp_enabled") cfg.xdp_enabled = (val != "0" && val != "false");
@@ -305,10 +307,12 @@ bool Config::Save(const std::string& path, std::string* err) const {
         out << "# Filtering\n";
         out << "datacenter_filter=" << (datacenter_filter ? 1 : 0) << "\n";
         out << "geo_enabled=" << (geo_enabled ? 1 : 0) << "\n";
+        out << "ipv6_enabled=" << (ipv6_enabled ? 1 : 0) << "\n";
         out << "auto_ban=" << (auto_ban ? 1 : 0) << "\n";
         out << "ban_seconds=" << ban_seconds << "\n";
         out << "per_ip_pps=" << per_ip_pps << "\n";
-        out << "rate_burst=" << rate_burst << "\n\n";
+        out << "rate_burst=" << rate_burst << "\n";
+        out << "egress_udp_pps=" << egress_udp_pps << "\n\n";
 
         out << "# Userspace DPI\n";
         out << "dpi_enabled=" << (dpi_enabled ? 1 : 0) << "\n";

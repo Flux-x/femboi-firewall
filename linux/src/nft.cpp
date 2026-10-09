@@ -14,26 +14,36 @@ namespace femboifw {
 
 namespace {
 
-// Validate and canonicalise a whitelist entry (single address or CIDR).
-// Returns an empty string for malformed input so it is skipped rather than
-// being injected into the ruleset script.
-std::string FormatIpRange(const std::string& raw) {
+// Validate and canonicalise a whitelist entry (single IPv4/IPv6 address or
+// CIDR). Returns false for malformed input so it is skipped rather than being
+// injected into the ruleset script. `is_v6` reports which family to file it in.
+bool FormatIpRangeEx(const std::string& raw, std::string* out, bool* is_v6) {
     std::string s = raw;
     size_t b = s.find_first_not_of(" \t\r\n");
     size_t e = s.find_last_not_of(" \t\r\n");
-    if (b == std::string::npos) return {};
+    if (b == std::string::npos) return false;
     s = s.substr(b, e - b + 1);
 
     const size_t slash = s.find('/');
     const std::string ip_part = slash == std::string::npos ? s : s.substr(0, slash);
+
     struct in_addr a;
-    if (inet_pton(AF_INET, ip_part.c_str(), &a) != 1) return {};
-    if (slash == std::string::npos) return ip_part;
+    struct in6_addr a6;
+    const bool v6 = inet_pton(AF_INET6, ip_part.c_str(), &a6) == 1;
+    if (!v6 && inet_pton(AF_INET, ip_part.c_str(), &a) != 1) return false;
+
+    *is_v6 = v6;
+    if (slash == std::string::npos) {
+        *out = ip_part;
+        return true;
+    }
 
     char* end = nullptr;
     const long prefix = strtol(s.c_str() + slash + 1, &end, 10);
-    if (end == s.c_str() + slash + 1 || prefix < 0 || prefix > 32) return {};
-    return ip_part + "/" + std::to_string(prefix);
+    const long max_prefix = v6 ? 128 : 32;
+    if (end == s.c_str() + slash + 1 || prefix < 0 || prefix > max_prefix) return false;
+    *out = ip_part + "/" + std::to_string(prefix);
+    return true;
 }
 
 // Format IP address range string
@@ -80,6 +90,10 @@ bool Nft::RunScript(const std::string& script, std::string* out, std::string* er
 std::string Nft::BuildScript(const Config& cfg, bool include_reset) {
     std::ostringstream s;
 
+    // Single per-IP budget reused by both the v4 and v6 rate meters.
+    const uint32_t pps = cfg.per_ip_pps > 0 ? cfg.per_ip_pps : 1000;
+    const uint32_t burst = cfg.rate_burst > 0 ? cfg.rate_burst : pps * 2;
+
     if (include_reset) {
         // Reset prior table state in the same `nft -f` transaction.
         s << "add table " << kFamily << " " << kTable << "\n";
@@ -92,6 +106,10 @@ std::string Nft::BuildScript(const Config& cfg, bool include_reset) {
     // Populated by the daemon (operator + explicitly configured admin IPs).
     s << "  set whitelist {\n"
          "    type ipv4_addr\n"
+         "    flags interval\n"
+         "  }\n";
+    s << "  set whitelist6 {\n"
+         "    type ipv6_addr\n"
          "    flags interval\n"
          "  }\n";
 
@@ -145,14 +163,27 @@ std::string Nft::BuildScript(const Config& cfg, bool include_reset) {
          "\n"
          "    iifname \"tailscale0\" accept\n"
          "\n"
-         // IPv6 is currently unmanaged by the enforcement sets (ipv4_addr).
-         // Pass it (with ICMPv6 control traffic) rather than blackholing NDP/RA.
-         "    meta nfproto ipv6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, packet-too-big } accept\n"
-         "    meta nfproto ipv6 counter accept comment \"ipv6-unmanaged\"\n"
-         "\n"
          // Trusted sources bypass every limit and auto-ban path.
          "    meta nfproto ipv4 ip saddr @whitelist counter accept comment \"whitelist\"\n"
+         "    meta nfproto ipv6 ip6 saddr @whitelist6 counter accept comment \"whitelist6\"\n"
          "\n"
+         // IPv6 policy: essential ICMPv6 control (ND/RA/PMTUD) and
+         // established/related traffic always pass. Everything else is denied
+         // by default, closing the audit hole where IPv6 was passed unfiltered.
+         // ipv6_enabled=1 replaces the blanket drop with v6 rate limiting.
+         "    meta nfproto ipv6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, packet-too-big } accept\n"
+         "    meta nfproto ipv6 ct state established,related counter accept comment \"ipv6-established\"\n";
+    if (!cfg.ipv6_enabled) {
+        s << "    meta nfproto ipv6 counter drop comment \"ipv6-denied\"\n";
+    } else {
+        // Rate-limit first; v6 is then accepted near the end of the chain,
+        // AFTER the family-agnostic sanitisation (TCP flags, ct invalid), so
+        // enabling v6 does not also disable those checks for it.
+        s << "    meta nfproto ipv6 icmpv6 type echo-request meter icmp6_flood { ip6 saddr limit rate over 10/second burst 20 packets } counter drop\n"
+             "    meta nfproto ipv6 meter m_v6 { ip6 saddr limit rate over " << pps
+          << "/second burst " << burst << " packets } counter drop\n";
+    }
+    s << "\n"
          "    ip saddr @banned counter drop\n"
          "    ip saddr . th dport @banned_ports counter drop\n"
          // Geo/ASN filtering applies to NEW flows only, so replies to the
@@ -234,9 +265,6 @@ std::string Nft::BuildScript(const Config& cfg, bool include_reset) {
          "\n"
          "    tcp flags & (fin|syn|rst|ack) == syn meter syn_flood { ip saddr limit rate over 120/second burst 240 packets } counter drop\n";
 
-    const uint32_t pps = cfg.per_ip_pps > 0 ? cfg.per_ip_pps : 1000;
-    const uint32_t burst = cfg.rate_burst > 0 ? cfg.rate_burst : pps * 2;
-
     for (const auto& p : cfg.ports) {
         if (!p.enabled || p.port == 0) continue;
         if (p.type == kPortSystem) continue;
@@ -305,6 +333,12 @@ std::string Nft::BuildScript(const Config& cfg, bool include_reset) {
         }
     }
 
+    // IPv6 (when enabled) is accepted here, after sanitisation and the
+    // per-source v6 meter above, but before the trailing blackhole drop.
+    if (cfg.ipv6_enabled) {
+        s << "    meta nfproto ipv6 counter accept comment \"ipv6-pass\"\n";
+    }
+
     s << "\n"
          // Established/related traffic is accepted only after every per-flow
          // meter and the nfqueue DPI hook have had a chance to see it.
@@ -318,8 +352,20 @@ std::string Nft::BuildScript(const Config& cfg, bool include_reset) {
          "\n"
          "  chain output {\n"
          "    type filter hook output priority 0; policy accept;\n"
-         "    ip daddr @geo_ratelimit meta mark set 0x42\n"
-         "  }\n"
+         "    ip daddr @geo_ratelimit meta mark set 0x42\n";
+    // Egress amplification guard: a spoofed A2S query can turn a game server
+    // into a reflector. Cap outbound UDP to the protected game ports globally
+    // and drop any reply with no tracked request behind it.
+    if (cfg.egress_udp_pps > 0) {
+        // A global `limit rate` (no meter key) is the correct form for a
+        // whole-server egress ceiling; a keyless `meter {}` is not valid nft.
+        s << "    udp sport { " << game_udp_ports
+          << " } ct state untracked counter drop comment \"egress-untracked\"\n"
+             "    udp sport { " << game_udp_ports << " } limit rate over "
+          << cfg.egress_udp_pps << "/second burst " << (cfg.egress_udp_pps * 2)
+          << " packets counter drop comment \"egress-a2s-rate\"\n";
+    }
+    s << "  }\n"
          "}\n";
 
     return s.str();
@@ -443,34 +489,62 @@ bool Nft::SyncBanSet(const std::set<uint32_t>& ips, std::string* err) {
 }
 
 // Synchronize the trusted-source set. Ranges are CIDR/address strings.
-bool Nft::SyncWhitelist(const std::vector<std::string>& entries, std::string* err) {
+namespace {
+
+// Flush a set, tolerating a not-yet-installed table (base ruleset absent).
+bool flush_set_tolerant(const std::string& set_name, std::string* err) {
     std::string out, e;
-    if (!Run({"flush", "set", kFamily, kTable, "whitelist"}, &out, &e)) {
-        // A missing set means the base ruleset is not installed yet; not fatal.
+    if (!Nft::Run({"flush", "set", Nft::kFamily, Nft::kTable, set_name}, &out, &e)) {
         if (e.find("No such file") == std::string::npos &&
             e.find("does not exist") == std::string::npos) {
             if (err) *err = e;
             return false;
         }
     }
+    return true;
+}
+
+} // namespace
+
+// Synchronize the trusted-source sets (IPv4 and IPv6). Ranges are CIDR or
+// single-address strings; each entry is filed by its family.
+bool Nft::SyncWhitelist(const std::vector<std::string>& entries, std::string* err) {
+    if (!flush_set_tolerant("whitelist", err)) return false;
+    if (!flush_set_tolerant("whitelist6", err)) return false;
     if (entries.empty()) return true;
 
-    std::ostringstream s;
-    s << "add element " << kFamily << " " << kTable << " whitelist { ";
-    bool first = true;
+    std::ostringstream v4, v6;
+    bool f4 = true, f6 = true;
     for (const auto& raw : entries) {
-        const std::string text = FormatIpRange(raw);
-        if (text.empty()) continue;
-        if (!first) s << ", ";
-        s << text;
-        first = false;
+        std::string text;
+        bool is_v6 = false;
+        if (!FormatIpRangeEx(raw, &text, &is_v6)) continue;
+        std::ostringstream& ss = is_v6 ? v6 : v4;
+        bool& first = is_v6 ? f6 : f4;
+        if (first) {
+            ss << "add element " << kFamily << " " << kTable << " "
+               << (is_v6 ? "whitelist6" : "whitelist") << " { ";
+            first = false;
+        } else {
+            ss << ", ";
+        }
+        ss << text;
     }
-    s << " }\n";
-    if (first) return true;
 
-    if (!RunScript(s.str(), &out, &e)) {
-        if (err) *err = e;
-        return false;
+    std::string out, e;
+    if (!f4) {
+        v4 << " }\n";
+        if (!RunScript(v4.str(), &out, &e)) {
+            if (err) *err = e;
+            return false;
+        }
+    }
+    if (!f6) {
+        v6 << " }\n";
+        if (!RunScript(v6.str(), &out, &e)) {
+            if (err) *err = e;
+            return false;
+        }
     }
     return true;
 }

@@ -23,12 +23,16 @@ using femboifw::run_argv;
 
 const char* kDefaultObject = "/usr/lib/femboi/femboi_xdp.o";
 
+// Defined after cmd_attach; forward-declared so the rollback watchdog can use it.
+static void remove_pins(const std::string& pin_dir, int* removed);
+
 // Display CLI usage details
 void usage() {
     std::cout <<
         "femboi-firewall-xdp — XDP datapath control\n"
         "\n"
-        "  attach [--iface IF] [--mode drv|skb|hw] [--obj PATH]\n"
+        "  attach [--iface IF] [--mode drv|skb|hw] [--obj PATH] [--rollback-secs N]\n"
+        "  attach-confirm                       cancel a pending rollback timer\n"
         "  detach [--iface IF]\n"
         "  block <ip> [seconds] [reason]\n"
         "  unblock <ip>\n"
@@ -99,9 +103,40 @@ std::string fmt_bytes(uint64_t b) {
 // same program object a second time (bpftool pins the first program only), so
 // it was removed. TC egress is the correct mechanism if outbound filtering is
 // ever needed.
+// Arm a watchdog that detaches the program after `secs` unless cancelled with
+// `attach-confirm`. This is the safety net against attaching a datapath that
+// blacks out management access: a stale timer reverts to no-XDP on its own.
+void arm_rollback(const std::string& iface, const std::string& pin_dir, long secs) {
+    if (secs <= 0) return;
+    // A leftover cancel marker from a previous run would defeat the new timer.
+    ::unlink((pin_dir + "/rollback.cancel").c_str());
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        std::cerr << "[!] rollback watchdog fork failed; no auto-revert armed\n";
+        return;
+    }
+    if (pid == 0) {
+        ::setsid();
+        ::sleep((unsigned)secs);
+        const std::string cancel = pin_dir + "/rollback.cancel";
+        if (::access(cancel.c_str(), F_OK) == 0) {
+            ::unlink(cancel.c_str());
+            ::_exit(0);  // operator confirmed; leave the program attached
+        }
+        std::string out, e;
+        run_argv({"ip", "link", "set", "dev", iface, "xdp", "off"}, &out, &e);
+        int removed = 0;
+        remove_pins(pin_dir, &removed);
+        ::_exit(0);
+    }
+    std::cout << "[i] rollback armed: detaching in " << secs
+              << "s unless `attach-confirm` is run\n";
+}
+
 int cmd_attach(const std::string& iface, const std::string& mode,
                const std::string& obj, const std::string& pin_dir,
-               std::string* err) {
+               long rollback_secs, std::string* err) {
     if (obj.empty() || access(obj.c_str(), R_OK) != 0) {
         *err = "BPF object not found: " + obj;
         return 1;
@@ -133,6 +168,7 @@ int cmd_attach(const std::string& iface, const std::string& mode,
                 // large performance regression (esp. virtio_net queues).
                 std::cout << "[!] native XDP unavailable; attached in generic SKB mode on "
                           << iface << " (expect much lower throughput)\n";
+                arm_rollback(iface, pin_dir, rollback_secs);
                 return 0;
             }
         }
@@ -140,6 +176,20 @@ int cmd_attach(const std::string& iface, const std::string& mode,
     }
 
     std::cout << "[+] attached on " << iface << " (" << attach_mode << ")\n";
+    arm_rollback(iface, pin_dir, rollback_secs);
+    return 0;
+}
+
+// Cancel a pending rollback timer (one-shot marker consumed by the watchdog).
+int cmd_attach_confirm(const std::string& pin_dir) {
+    const std::string marker = pin_dir + "/rollback.cancel";
+    FILE* f = ::fopen(marker.c_str(), "wb");
+    if (!f) {
+        std::cerr << "error: cannot write " << marker << "\n";
+        return 1;
+    }
+    ::fclose(f);
+    std::cout << "[+] rollback cancelled\n";
     return 0;
 }
 
@@ -178,7 +228,7 @@ int cmd_detach(const std::string& iface, const std::string& pin_dir) {
 // Display packet filter statistics
 void print_stats(const struct fw_stats& s, double seconds, bool with_rates) {
     const uint64_t dropped = s.drop_blacklist + s.drop_pps + s.drop_syn +
-                             s.drop_udp + s.drop_icmp + s.drop_malformed;
+                             s.drop_udp + s.drop_icmp + s.drop_malformed + s.drop_ipv6;
     const uint64_t total = s.pass + dropped;
 
     std::cout << "packets   : " << total << "  (pass " << s.pass
@@ -193,6 +243,7 @@ void print_stats(const struct fw_stats& s, double seconds, bool with_rates) {
               << " syn=" << s.drop_syn
               << " udp=" << s.drop_udp
               << " icmp=" << s.drop_icmp
+              << " ipv6=" << s.drop_ipv6
               << " malformed=" << s.drop_malformed << "\n";
     std::cout << "auto-bans : " << s.auto_bans << "\n";
 }
@@ -261,12 +312,12 @@ static int HandleDoctor(const std::string& iface, const std::string& pin_dir) {
 
 // Attach XDP program to network interface
 static int HandleAttach(const std::string& iface, const std::string& mode, const std::string& obj,
-                         const std::string& pin_dir) {
+                         const std::string& pin_dir, long rollback_secs) {
     if (!is_root()) { std::cerr << "error: attach needs root\n"; return 1; }
     // /sys/fs/bpf is mounted by systemd (bpffs); mkdir is unnecessary there.
     ::mkdir(pin_dir.c_str(), 0700);
     std::string err;
-    const int rc = cmd_attach(iface, mode, obj, pin_dir, &err);
+    const int rc = cmd_attach(iface, mode, obj, pin_dir, rollback_secs, &err);
     if (rc != 0) { std::cerr << "error: " << err << "\n"; return rc; }
 
     XdpMaps maps;
@@ -310,6 +361,7 @@ static int HandleStats(XdpMaps& maps, bool watch, double interval) {
         d.drop_udp = cur.drop_udp - prev.drop_udp;
         d.drop_icmp = cur.drop_icmp - prev.drop_icmp;
         d.drop_malformed = cur.drop_malformed - prev.drop_malformed;
+        d.drop_ipv6 = cur.drop_ipv6 - prev.drop_ipv6;
         d.auto_bans = cur.auto_bans;
 
         printf("\033[H\033[J");
@@ -492,6 +544,7 @@ int main(int argc, char** argv) {
     bool watch = false;
     double interval = 1.0;
     size_t limit = 500;
+    long rollback_secs = 0;
 
     int i = 1;
     while (i < argc) {
@@ -512,6 +565,7 @@ int main(int argc, char** argv) {
         else if (a == "--watch" || a == "-w") watch = true;
         else if (a == "--interval") interval = atof(need("--interval").c_str());
         else if (a == "--limit") limit = (size_t)strtoul(need("--limit").c_str(), nullptr, 10);
+        else if (a == "--rollback-secs") rollback_secs = strtol(need("--rollback-secs").c_str(), nullptr, 10);
         else if (command.empty()) command = a;
         else rest.push_back(a);
         ++i;
@@ -521,7 +575,8 @@ int main(int argc, char** argv) {
     if (iface.empty()) iface = default_iface();
 
     if (command == "doctor") return HandleDoctor(iface, pin_dir);
-    if (command == "attach") return HandleAttach(iface, mode, obj, pin_dir);
+    if (command == "attach") return HandleAttach(iface, mode, obj, pin_dir, rollback_secs);
+    if (command == "attach-confirm") return cmd_attach_confirm(pin_dir);
     if (command == "detach") return HandleDetach(iface, pin_dir);
 
     XdpMaps maps;

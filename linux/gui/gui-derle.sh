@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compile the Fluxx Firewall desktop panel from Windows.
+# Cross-compile the Femboi Firewall desktop panel from Windows.
 #
 # Why this is more involved than the firewall build: the daemon is static musl
 # with zero dependencies, so `zig c++ -static` is the whole story. A GUI is the
@@ -16,7 +16,7 @@
 #     libraries the GUI cannot function without anyway.
 #
 # Usage:
-#   ./gui-derle.sh              build bin/fluxxfw-gui
+#   ./gui-derle.sh              build bin/fw-gui
 #   ./gui-derle.sh --clean
 #   ./gui-derle.sh --check      compile only, do not link
 set -uo pipefail

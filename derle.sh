@@ -131,7 +131,8 @@ LDFLAGS=(-pie -Wl,-z,relro,-z,now)
 mkdir -p "$OUT_DIR" "$OBJ_DIR"
 
 SOURCES=("$SRC_DIR/util.cpp" "$SRC_DIR/engine.cpp" "$SRC_DIR/nft.cpp"
-         "$SRC_DIR/dpi.cpp" "$SRC_DIR/conntrack.cpp" "$SRC_DIR/main.cpp")
+         "$SRC_DIR/dpi.cpp" "$SRC_DIR/conntrack.cpp" "$SRC_DIR/fw_ctl.cpp"
+         "$SRC_DIR/main.cpp")
 
 for f in "${SOURCES[@]}"; do
     [[ -f "$f" ]] || die "missing source: $f"

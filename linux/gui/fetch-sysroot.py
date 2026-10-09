@@ -67,7 +67,7 @@ def _check_public(url):
 
 def fetch(url, timeout=120):
     _check_public(url)
-    req = urllib.request.Request(url, headers={"User-Agent": "fluxx-crossbuild"})
+    req = urllib.request.Request(url, headers={"User-Agent": "femboi-crossbuild"})
     with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 - validated above
         return r.read()
 

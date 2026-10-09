@@ -293,12 +293,13 @@ open:** clearing `port_class` for ports removed from config, LRU race in
 
 ## E. GUI
 
-### 29, 30 — ⏸️ DEFERRED
-`fw_gui.cpp` shells to `conntrack` (rejected by the allowlist) and writes
-`/etc/femboi` as root; the Python Tk GUI still calls the pre-rename
-`/usr/local/bin/fluxxfw`. The right fix is a daemon control socket
-(SO_PEERCRED/polkit) plus renaming the Python entry points and README. Deferred
-as a separate GUI-focused change to keep this PR reviewable.
+### 29, 30 — ✅ FIXED
+A daemon control socket (`/run/femboi/ctl.sock`, `fw_ctl.hpp/.cpp`) with
+`SO_PEERCRED` authorization (uid 0 or the daemon uid), mode 0660, no TCP
+listener, now backs `status`/`stats`/`list`/`ban`/`unban`/`set`. Both GUIs route
+enforcement through it; the C++ panel dropped its direct `nft`/`conntrack`
+shell-outs, and the Python panel no longer calls the pre-rename binary. See
+Update 3.
 
 ---
 
@@ -395,3 +396,47 @@ maps) are the least-verified changes here. The `.deb`/CI now build with
 5. Daemon control socket for the GUI + Python GUI rename (items 29, 30).
 6. Geo: wire per-country limits; atomic rules write; reload trigger (item 16).
 7. Logging + SHA-256 via OpenSSL (item 27).
+
+---
+
+## Update 3 — fortress pass (IPv6, control socket, L7, egress, geoverify)
+
+A third pass closed the remaining critical gaps. **Still static-review only — no
+compiler/kernel in this environment; CI and a live host are the gates.**
+
+- **IPv4-only bans, unfiltered IPv6 (critical) — FIXED.** New `ipv6_enabled`
+  config (default **0** = deny). In the default-deny mode the input chain drops
+  all IPv6 except loopback, essential ICMPv6 (ND/RA/PMTUD) and
+  established/related flows — the previous `ipv6-unmanaged` accept is gone.
+  `ipv6_enabled=1` applies v6 sanitisation + a per-source v6 PPS meter and an
+  ICMPv6 flood meter, accepting v6 only after the family-agnostic
+  sanitisation. XDP mirrors this with `FW_FLAG_IPV6_DENY` and a `drop_ipv6`
+  counter (`handle_ipv6`). A `whitelist6` set (populated from `whitelist=`
+  v6/CIDR entries) bypasses both.
+- **GUI ↔ daemon control socket + rename (items 29, 30) — FIXED.** `fw_ctl`
+  (see item 29/30 above). CLI gains `control <request...>`. `gui/fw-gui` and
+  `linux/gui/fw_gui.cpp` now use the socket for status/stats/list/ban/unban/set
+  and drop the `conntrack` shell-outs; remaining `fluxxfw`/`Fluxx` strings
+  and the `/usr/share/fluxxfw` GeoIP path are renamed. A unit test covers
+  control-line dispatch.
+- **L7 Aho–Corasick (item 25) — FIXED.** Case-insensitive Aho–Corasick over
+  the signature set replaces the O(len×patterns) substring scan; one linear
+  pass, non-ASCII bytes reset state. Covered by a unit test.
+- **Egress A2S amplification — MITIGATED.** Output chain caps outbound UDP to
+  the protected game ports globally (`egress_udp_pps`, default 4000) and drops
+  replies with no tracked request (`ct state untracked`).
+- **XDP attach rollback — ADDED.** `femboi-firewall-xdp attach --rollback-secs N`
+  arms a watchdog that detaches after N seconds unless `attach-confirm` runs,
+  so a datapath that blacks out access reverts on its own.
+- **GeoIP integrity — ADDED.** `tools/geoip/update.sh` downloads over HTTPS,
+  requires the `.sha256` sidecar, optionally verifies a GPG signature, and
+  installs atomically. The daemon refuses a dataset that does not match a
+  present `.sha256` (`LoadGeoVerified`).
+- **systemd/deb.** Unit gains `RuntimeDirectory=femboi`; `postinst` creates the
+  `femboi` group for socket access.
+
+**Residual / unverified:** the new XDP IPv6 path, the v6 nftables block, the
+control-socket server, and the L7 automaton have not been compiled here. CI
+(`build+test`, `nft -c -f`, XDP verifier) is the gate. IPv6 bans/geo remain
+IPv4-only (documented); `ipv6_enabled=1` is rate-limit/sanitise, not per-IP v6
+ban storage. The GUI's `cti_enabled` toggle is a no-op (unknown key).

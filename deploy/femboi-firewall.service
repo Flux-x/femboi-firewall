@@ -21,6 +21,9 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=20s
+# The daemon's admin control socket lives here (mode 0750, root-owned).
+RuntimeDirectory=femboi
+RuntimeDirectoryMode=0750
 
 # --- Hardening ---
 NoNewPrivileges=yes

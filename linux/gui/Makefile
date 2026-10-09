@@ -1,4 +1,4 @@
-# Fluxx Firewall desktop panel — Linux build
+# Femboi Firewall desktop panel — Linux build
 #
 # ImGui is vendored under imgui/ rather than taken from the distro package: the
 # layout is a direct port of the Windows build, and a distro version bump is a
@@ -6,8 +6,8 @@
 # faithful copy. The vendored tree is upstream, unmodified, MIT.
 #
 # Build:
-#   make            -> fluxxfw-gui
-#   make install    -> /usr/local/bin/fluxxfw-gui (+ desktop entry refresh)
+#   make            -> fw-gui
+#   make install    -> /usr/local/bin/fw-gui (+ desktop entry refresh)
 #   make clean
 
 CXX      ?= g++

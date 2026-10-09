@@ -126,9 +126,10 @@ static __always_inline void ban_source(__u32 saddr, __u32 reason, __u64 ttl_ns,
 		st->auto_bans++;
 }
 
-// Resolve the IPv4 header, skipping up to two 802.1Q/802.1ad VLAN tags.
-// Returns NULL if the frame is malformed or not a bare IPv4 frame.
-static __always_inline struct iphdr *l3_ipv4(void *data, void *data_end)
+// Walk the Ethernet header and up to two 802.1Q/802.1ad VLAN tags, returning
+// the L3 payload pointer and writing the encapsulated EtherType. Returns NULL
+// on a malformed frame. Shared by the IPv4 and IPv6 paths.
+static __always_inline void *l3_payload(void *data, void *data_end, __u16 *out_proto)
 {
 	struct ethhdr *eth = data;
 	if ((void *)(eth + 1) > data_end)
@@ -151,13 +152,57 @@ static __always_inline struct iphdr *l3_ipv4(void *data, void *data_end)
 		}
 	}
 
-	if (h_proto != bpf_htons(ETH_P_IP))
+	*out_proto = h_proto;
+	return nh;
+}
+
+// Resolve the IPv4 header. Returns NULL if the frame is malformed or not IPv4.
+static __always_inline struct iphdr *l3_ipv4(void *data, void *data_end)
+{
+	__u16 h_proto = 0;
+	void *nh = l3_payload(data, data_end, &h_proto);
+	if (!nh || h_proto != bpf_htons(ETH_P_IP))
 		return NULL;
 
 	struct iphdr *ip = nh;
 	if ((void *)(ip + 1) > data_end)
 		return NULL;
 	return ip;
+}
+
+// IPv6 policy. When FW_FLAG_IPV6_DENY is set (the default; `ipv6_enabled=0`),
+// drop all IPv6 except essential ICMPv6 control (ND/RA + packet-too-big) so
+// neighbour discovery and path MTU still work. Otherwise pass, letting the
+// nftables tier apply v6 rate limiting.
+static __always_inline int handle_ipv6(void *nh, void *data_end,
+				       struct fw_config *cfg, struct fw_stats *st,
+				       __u64 bytes)
+{
+	if (!cfg || !cfg->enabled)
+		return XDP_PASS;
+	if (!(cfg->flags & FW_FLAG_IPV6_DENY)) {
+		count_pass(st, bytes);
+		return XDP_PASS;
+	}
+
+	struct ipv6hdr *ip6 = nh;
+	if ((void *)(ip6 + 1) > data_end)
+		return XDP_PASS;
+
+	if (ip6->nexthdr == IPPROTO_ICMPV6) {
+		__u8 *icmp6 = (void *)(ip6 + 1);
+		if ((void *)icmp6 + 2 <= data_end) {
+			const __u8 t = icmp6[0];
+			// 2 = packet-too-big (PMTUD), 133/134 = router sol/advert,
+			// 135/136 = neighbour sol/advert.
+			if (t == 2 || t == 133 || t == 134 || t == 135 || t == 136) {
+				count_pass(st, bytes);
+				return XDP_PASS;
+			}
+		}
+	}
+
+	DROP_COUNT(st, drop_ipv6, bytes);
 }
 
 // Main XDP ingress filter program
@@ -168,6 +213,16 @@ int xdp_fw(struct xdp_md *ctx)
 	void *data_end = (void *)(long)ctx->data_end;
 
 	struct fw_stats *st = get_stats();
+
+	// IPv6 is evaluated before the IPv4 parse so a default-deny policy actually
+	// applies in the datapath instead of silently passing every v6 frame.
+	{
+		__u16 eth_p = 0;
+		void *nh = l3_payload(data, data_end, &eth_p);
+		if (nh && eth_p == bpf_htons(ETH_P_IPV6))
+			return handle_ipv6(nh, data_end, get_config(), st,
+					   (__u64)(data_end - data));
+	}
 
 	struct iphdr *ip = l3_ipv4(data, data_end);
 	if (!ip)

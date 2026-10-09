@@ -368,6 +368,7 @@ struct XdpMaps {
             total.drop_malformed += s.drop_malformed;
             total.drop_system_port += s.drop_system_port;
             total.auto_bans += s.auto_bans;
+            total.drop_ipv6 += s.drop_ipv6;
         }
         *out = total;
         return true;

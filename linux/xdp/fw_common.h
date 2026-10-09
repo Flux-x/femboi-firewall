@@ -10,6 +10,12 @@
 #ifndef ETH_P_IP
 #define ETH_P_IP 0x0800
 #endif
+#ifndef ETH_P_IPV6
+#define ETH_P_IPV6 0x86DD
+#endif
+#ifndef IPPROTO_ICMPV6
+#define IPPROTO_ICMPV6 58
+#endif
 
 // 802.1Q / 802.1ad tags (VLAN walking in the datapath).
 #ifndef ETH_P_8021Q
@@ -41,6 +47,8 @@
 #define FW_FLAG_ICMP_ENABLED (1u << 0)
 #define FW_FLAG_AUTO_BAN (1u << 1)
 #define FW_FLAG_COUNT_BYTES (1u << 2)
+// Deny IPv6 by default (only ND/RA/PMTUD pass) when IPv6 is not enforced.
+#define FW_FLAG_IPV6_DENY (1u << 3)
 
 // Per IP rate accounting window
 struct fw_rate {
@@ -84,6 +92,7 @@ struct fw_stats {
 	__u64 drop_malformed;
 	__u64 drop_system_port;
 	__u64 auto_bans;
+	__u64 drop_ipv6;
 };
 
 #endif // FW_COMMON_H

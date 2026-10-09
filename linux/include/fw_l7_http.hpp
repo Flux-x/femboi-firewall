@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cctype>
+#include <vector>
 
 enum L7Result {
     L7_OK = 0,
@@ -167,6 +168,87 @@ static const struct {
     { "() { :; };", sizeof("() { :; };") - 1 }
 };
 
+// --- Case-insensitive Aho-Corasick over the signature set -------------------
+// Replaces the previous O(len * patterns) substring scan with a single linear
+// pass. Patterns are ASCII, so a byte >= 0x80 cannot be part of a match and
+// resets the automaton state.
+struct L7AcNode {
+    int next[128];
+    int fail;
+    bool match;
+    L7AcNode() : fail(0), match(false) {
+        for (int i = 0; i < 128; i++) next[i] = -1;
+    }
+};
+
+inline const std::vector<L7AcNode>& l7_ac_automaton() {
+    // Function-local static (value, not a leaked pointer) so LeakSanitizer in
+    // the CI sanitizer run stays clean.
+    static const std::vector<L7AcNode> inst = []() {
+        std::vector<L7AcNode> nodes;
+        nodes.emplace_back();
+        for (const auto& p : kMaliciousPatterns) {
+            int cur = 0;
+            for (size_t i = 0; i < p.len; i++) {
+                const unsigned char raw = (unsigned char)p.pattern[i];
+                if (raw >= 128) continue;
+                const int c = (raw >= 'A' && raw <= 'Z') ? raw + 32 : raw;
+                if (nodes[cur].next[c] == -1) {
+                    nodes[cur].next[c] = (int)nodes.size();
+                    nodes.emplace_back();
+                }
+                cur = nodes[cur].next[c];
+            }
+            nodes[cur].match = true;
+        }
+
+        // Breadth-first construction of failure links.
+        std::vector<int> queue;
+        queue.reserve(nodes.size());
+        for (int c = 0; c < 128; c++) {
+            const int v = nodes[0].next[c];
+            if (v != -1) {
+                nodes[v].fail = 0;
+                queue.push_back(v);
+            }
+        }
+        for (size_t qi = 0; qi < queue.size(); ++qi) {
+            const int u = queue[qi];
+            if (nodes[nodes[u].fail].match) nodes[u].match = true;
+            for (int c = 0; c < 128; c++) {
+                const int v = nodes[u].next[c];
+                if (v == -1) continue;
+                int f = nodes[u].fail;
+                while (f != 0 && nodes[f].next[c] == -1) f = nodes[f].fail;
+                const int t = nodes[f].next[c];
+                nodes[v].fail = (t != -1) ? t : 0;
+                queue.push_back(v);
+            }
+        }
+        return nodes;
+    }();
+    return inst;
+}
+
+inline int l7_ac_step(int state, int c) {
+    const std::vector<L7AcNode>& a = l7_ac_automaton();
+    while (state != 0 && a[state].next[c] == -1) state = a[state].fail;
+    return a[state].next[c] != -1 ? a[state].next[c] : 0;
+}
+
+inline bool l7_ac_has_match(const char* buf, size_t len) {
+    const std::vector<L7AcNode>& a = l7_ac_automaton();
+    int state = 0;
+    for (size_t i = 0; i < len; i++) {
+        const unsigned char raw = (unsigned char)buf[i];
+        if (raw >= 128) { state = 0; continue; }
+        const int c = (raw >= 'A' && raw <= 'Z') ? raw + 32 : raw;
+        state = l7_ac_step(state, c);
+        if (a[state].match) return true;
+    }
+    return false;
+}
+
 // Inspect HTTP request payload
 static inline L7Result l7_inspect_http(const unsigned char* payload, unsigned int len) {
     if (len == 0) return L7_OK;
@@ -218,21 +300,16 @@ static inline L7Result l7_inspect_http(const unsigned char* payload, unsigned in
         }
     }
 
-    for (const auto& p : kMaliciousPatterns) {
-        if (l7_find_substr_ci(req_start, scan_len, p.pattern, p.len)) {
-            return L7_SCANNER_PROBE;
-        }
+    if (l7_ac_has_match(req_start, scan_len)) {
+        return L7_SCANNER_PROBE;
     }
 
     char decoded_buf[512];
     size_t decoded_len = l7_url_decode(req_start, scan_len, decoded_buf, sizeof(decoded_buf));
     if (decoded_len > 0) {
         decoded_len = l7_normalize_path(decoded_buf, decoded_len);
-
-        for (const auto& p : kMaliciousPatterns) {
-            if (l7_find_substr_ci(decoded_buf, decoded_len, p.pattern, p.len)) {
-                return L7_SCANNER_PROBE;
-            }
+        if (l7_ac_has_match(decoded_buf, decoded_len)) {
+            return L7_SCANNER_PROBE;
         }
     }
 

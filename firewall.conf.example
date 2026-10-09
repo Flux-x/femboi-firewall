@@ -29,6 +29,12 @@ datacenter_filter=0
 # Enable country geo-filtering (see rules_path).
 geo_enabled=1
 
+# IPv6 policy. 0 (default) denies all inbound IPv6 except essential ICMPv6
+# (neighbour discovery, router advertisements, PMTU) and established flows,
+# closing the "IPv6 passed unfiltered" hole. 1 enables IPv6 with sanitisation
+# and per-source rate limiting (whitelist honoured; geo/ban data is IPv4-only).
+ipv6_enabled=0
+
 # Auto-ban IPs exceeding thresholds.
 auto_ban=1
 ban_seconds=3600
@@ -37,6 +43,10 @@ ban_seconds=3600
 # source floods, not distributed ones (use upstream scrubbing for Gbps).
 per_ip_pps=400
 rate_burst=800
+
+# Global outbound UDP ceiling toward the protected game ports (packets/s).
+# Throttles A2S reflection/amplification from the game server; 0 disables.
+egress_udp_pps=4000
 
 # Userspace DPI packet inspection (requires a --with-dpi build).
 dpi_enabled=0

@@ -6,6 +6,8 @@
 //   - Config::Load multi-slot retention and Save round-trip (item 14)
 #include "fw.hpp"
 #include "fw_portable.hpp"
+#include "fw_ctl.hpp"
+#include "fw_l7_http.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -160,12 +162,61 @@ static void test_config_roundtrip() {
     unlink(out_path.c_str());
 }
 
+static void test_l7_automaton() {
+    // Aho-Corasick must match the same signatures the old substring scan did,
+    // case-insensitively, and must not false-positive on benign requests.
+    CHECK(l7_ac_has_match("/.env", 5));
+    CHECK(l7_ac_has_match("/.ENV", 5));
+    CHECK(l7_ac_has_match("GET /.git/config HTTP/1.1", 24));
+    CHECK(l7_ac_has_match("X${jndi:ldap://x}", 17));
+    CHECK(!l7_ac_has_match("/index.html", 11));
+    CHECK(!l7_ac_has_match("HELLO WORLD", 11));
+}
+
+static void test_ctl_dispatch() {
+    // The control-socket request parser routes verbs and splits optional
+    // ttl/reason fields exactly as the CLI does.
+    CtlHandlers h;
+    std::string last;
+    h.status = []() { return std::string("{\"ok\":true,\"engine\":\"running\"}"); };
+    h.ban = [&](const std::string& ip, long long ttl, const std::string& reason) {
+        last = ip + "|" + std::to_string(ttl) + "|" + reason;
+        return std::string("{\"ok\":true}");
+    };
+    h.unban = [&](const std::string& ip) {
+        last = "u:" + ip;
+        return std::string("{\"ok\":true}");
+    };
+    h.set = [&](const std::string& k, const std::string& v) {
+        last = "s:" + k + "=" + v;
+        return std::string("{\"ok\":true}");
+    };
+
+    CHECK(HandleCtlLine("status", h).find("running") != std::string::npos);
+
+    (void)HandleCtlLine("ban 1.2.3.4 3600 ssh brute force", h);
+    CHECK(last == "1.2.3.4|3600|ssh brute force");
+
+    (void)HandleCtlLine("ban 1.2.3.4", h);
+    CHECK(last == "1.2.3.4|0|manual");
+
+    (void)HandleCtlLine("unban 5.6.7.8", h);
+    CHECK(last == "u:5.6.7.8");
+
+    (void)HandleCtlLine("set per_ip_pps 500", h);
+    CHECK(last == "s:per_ip_pps=500");
+
+    CHECK(HandleCtlLine("bogus", h).find("\"ok\":false") != std::string::npos);
+}
+
 int main() {
     test_split_packet_order();
     test_connless_packet();
     test_bantable();
     test_ban_store_roundtrip();
     test_config_roundtrip();
+    test_l7_automaton();
+    test_ctl_dispatch();
 
     if (g_failures == 0) {
         std::printf("all tests passed\n");

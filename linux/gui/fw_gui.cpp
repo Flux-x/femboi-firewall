@@ -1,5 +1,5 @@
 // ===================================================================
-// Fluxx Firewall — Linux desktop panel
+// Femboi Firewall — Linux desktop panel
 //
 // Port of windows-retired/gui.cpp, layout-faithful. Same window chrome, same
 // header, same six tabs in the same order, same palette values, same widget
@@ -7,7 +7,7 @@
 //
 // Where the Windows build read an in-process engine over a named pipe, this reads
 // what the kernel and the config already hold:
-//   counters  -> `nft -a list table inet fluxxfw`, split into passed (the rule
+//   counters  -> `nft -a list table inet femboifw`, split into passed (the rule
 //                marked comment "passed") and blocked (every rule carrying drop)
 //   bans      -> the `banned` set, which is what is actually being dropped
 //   ports     -> the ports= line in /etc/femboi/firewall.conf
@@ -15,7 +15,7 @@
 //                Windows GUI writes and the daemon reads
 //   players   -> the game server plugin's per-instance snapshot
 //
-// Settings writes through `fluxxfw set <key> <value>` instead of editing the
+// Settings writes through `femboi-firewall set <key> <value>` instead of editing the
 // config itself: one writer for that file, and the daemon re-applies from its
 // in-memory ban table so a change never releases the bans in force.
 //
@@ -34,6 +34,8 @@
 
 #include <GLFW/glfw3.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <algorithm>
 #include <atomic>
@@ -151,7 +153,7 @@ struct Snapshot {
 };
 
 // ---------------------------------------------------------------------------
-// GeoIP Database Loader & Lookup (fast binary search over /usr/share/fluxxfw/geoip.dat)
+// GeoIP Database Loader & Lookup (fast binary search over /usr/share/femboi/geoip.dat)
 // ---------------------------------------------------------------------------
 struct GeoRange {
     uint32_t start_ip;
@@ -272,6 +274,47 @@ std::string nft(const std::vector<std::string>& args) {
 
 std::string read_file(const char* path);
 
+// --- Daemon control socket --------------------------------------------------
+// Enforcement actions (ban/unban/set) go through the daemon so the GUI never
+// runs nftables itself and there is exactly one writer for ban state.
+constexpr const char* kCtlSock = "/run/femboi/ctl.sock";
+
+bool ctl_call(const std::string& request, std::string* out) {
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return false;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (strlen(kCtlSock) >= sizeof(addr.sun_path)) {
+        ::close(fd);
+        return false;
+    }
+    strncpy(addr.sun_path, kCtlSock, sizeof(addr.sun_path) - 1);
+
+    bool ok = ::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
+    if (ok) {
+        const std::string req = request + "\n";
+        if (::send(fd, req.data(), req.size(), 0) < 0) ok = false;
+    }
+    if (ok) {
+        std::string resp;
+        char buf[512];
+        for (;;) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            resp.append(buf, (size_t)n);
+            if (resp.find('\n') != std::string::npos) break;
+            if (resp.size() > 65536) break;
+        }
+        const size_t nl = resp.find('\n');
+        if (nl != std::string::npos) resp.resize(nl);
+        if (out) *out = resp;
+        ok = !resp.empty();
+    }
+    ::close(fd);
+    return ok;
+}
+
 static long long parse_nft_duration(const char* s) {
     long long total = 0;
     long long cur = 0;
@@ -327,6 +370,9 @@ void instant_unban(Snapshot& s, const std::string& ip, unsigned int port = 0) {
         else ++it;
     }
     std::thread([ip, port]() {
+        std::string resp;
+        if (ctl_call("unban " + ip, &resp)) return;  // daemon owns enforcement
+        // Fallback: daemon down, clear the kernel tiers directly.
         if (port > 0) {
             nft({"delete", "element", "inet", "femboifw", "banned_ports", "{", ip, ".", std::to_string(port), "}"});
         }
@@ -365,25 +411,25 @@ void instant_ban(Snapshot& s, const std::string& ip, unsigned int port, long lon
     }
     s.blocked++;
 
-    std::thread([ip, port, ttl]() {
+    std::thread([ip, port, ttl, reason]() {
+        std::string req = "ban " + ip;
+        if (ttl > 0) req += " " + std::to_string(ttl);
+        req += " " + reason;
+        std::string resp;
+        if (ctl_call(req, &resp)) return;  // daemon owns enforcement + state
+        // Fallback: daemon down, apply directly to the kernel tiers.
         if (port > 0) {
-            // Per-port ban: ONLY block on the game server port
             if (ttl > 0) {
                 nft({"add", "element", "inet", "femboifw", "banned_ports", "{", ip, ".", std::to_string(port), "timeout", std::to_string(ttl) + "s", "}"});
             } else {
                 nft({"add", "element", "inet", "femboifw", "banned_ports", "{", ip, ".", std::to_string(port), "}"});
             }
-            femboifw::run_argv({"conntrack", "-D", "-s", ip, "-p", "udp", "--dport", std::to_string(port)}, nullptr, nullptr);
-            femboifw::run_argv({"conntrack", "-D", "-s", ip, "-p", "tcp", "--dport", std::to_string(port)}, nullptr, nullptr);
         } else {
-            // Global ban across all ports
             if (ttl > 0) {
                 nft({"add", "element", "inet", "femboifw", "banned", "{", ip, "timeout", std::to_string(ttl) + "s", "}"});
             } else {
                 nft({"add", "element", "inet", "femboifw", "banned", "{", ip, "}"});
             }
-            femboifw::run_argv({"conntrack", "-D", "-s", ip}, nullptr, nullptr);
-            femboifw::run_argv({"conntrack", "-D", "-d", ip}, nullptr, nullptr);
             femboifw::run_argv({"/usr/local/bin/femboi-firewall-xdp", "block", ip, std::to_string(ttl > 0 ? ttl : 3600)}, nullptr, nullptr);
         }
     }).detach();
@@ -391,6 +437,15 @@ void instant_ban(Snapshot& s, const std::string& ip, unsigned int port, long lon
 
 // Instant non-blocking settings change. Updates file immediately and reloads in background
 bool set_setting(const std::string& key, const std::string& value) {
+    // Route through the daemon so a single writer owns the config and the
+    // change is validated + applied atomically. Fall back to editing the file
+    // when the daemon is not running.
+    {
+        std::string resp;
+        if (ctl_call("set " + key + " " + value, &resp)) {
+            return resp.find("\"ok\":true") != std::string::npos;
+        }
+    }
     std::string cfg = read_file(kConfPath);
     if (!cfg.empty()) {
         std::string pattern = key + "=";
@@ -2460,7 +2515,7 @@ int main() {
     if (access("/usr/share/femboi/geoip.dat", R_OK) == 0) {
         g_geo.Load("/usr/share/femboi/geoip.dat");
     } else {
-        g_geo.Load("/usr/share/fluxxfw/geoip.dat");
+        g_geo.Load("/usr/share/femboi/geoip.dat");
     }
 
     if (!glfwInit()) {

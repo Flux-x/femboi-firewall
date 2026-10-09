@@ -26,12 +26,39 @@ comment inside the file should carry the generator version, source and date.
 
 ## Updates
 
-A systemd timer can refresh the dataset out-of-band:
+The `update.sh` script refreshes the dataset with mandatory integrity checks:
 
-- download to a temp file
-- verify a checksum/signature
-- atomically `rename()` over `/usr/share/femboi/geoip.dat`
-- `systemctl reload femboi-firewall`
+```sh
+sudo GEOIP_URL=https://example.org/femboi \
+     GEOIP_PUBKEY=/etc/femboi/geoip-signing.pub \
+     ./tools/geoip/update.sh
+```
 
-See the audit report for the full plan (item 32/39). Until the timer exists,
-refresh manually and reload.
+- downloads `geoip.dat` over HTTPS
+- verifies the `.sha256` sidecar (required; nothing installs on mismatch)
+- optionally verifies a detached `.asc` signature with `gpg` when
+  `GEOIP_PUBKEY` is set
+- atomically replaces the dataset and writes the matching `.sha256`
+- reloads the daemon
+
+On startup the daemon itself enforces the same guard: if a
+`<geoip>.sha256` sidecar exists next to the dataset, `geodb` refuses to load a
+file that does not match it, so a tampered or partially written dataset cannot
+silently change which countries are blocked.
+
+### systemd timer
+
+```ini
+# /etc/systemd/system/femboi-geoip.service
+[Service]
+Type=oneshot
+Environment=GEOIP_URL=https://example.org/femboi
+Environment=GEOIP_PUBKEY=/etc/femboi/geoip-signing.pub
+ExecStart=/usr/share/femboi/update.sh
+
+# /etc/systemd/system/femboi-geoip.timer
+[Timer]
+OnCalendar=weekly
+Persistent=true
+```
+

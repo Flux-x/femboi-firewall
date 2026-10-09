@@ -8,6 +8,14 @@ case "$1" in
         install -d -m 0700 /var/lib/femboi
         install -d -m 0755 /usr/share/femboi
 
+        # System group for unprivileged access to the daemon control socket
+        # (/run/femboi/ctl.sock, mode 0660 root:femboi). Add trusted operators
+        # with `usermod -aG femboi <user>`.
+        if command -v addgroup >/dev/null 2>&1 && \
+           ! getent group femboi >/dev/null 2>&1; then
+            addgroup --system femboi >/dev/null 2>&1 || true
+        fi
+
         # sysctl hardening drop-in (idempotent; the daemon writes its own copy
         # at runtime, but shipping it here applies it at boot).
         if [ ! -e /etc/sysctl.d/90-femboi.conf ]; then

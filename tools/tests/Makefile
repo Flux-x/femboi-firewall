@@ -1,7 +1,8 @@
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wno-unused-parameter -O2
 INCLUDES := -I../../linux/include -I../../linux/xdp
-SRCS     := test_core.cpp ../../linux/src/engine.cpp ../../linux/src/util.cpp
+SRCS     := test_core.cpp ../../linux/src/engine.cpp ../../linux/src/util.cpp \
+            ../../linux/src/fw_ctl.cpp
 BIN      := test_core
 
 .PHONY: test test-sanitize clean

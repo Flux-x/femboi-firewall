@@ -1,6 +1,7 @@
 // Femboi Firewall daemon and CLI
 #include "fw.hpp"
 #include "fw_portable.hpp"
+#include "fw_ctl.hpp"
 #include "proc.hpp"
 #include "../xdp/xdp_maps.hpp"
 
@@ -31,6 +32,9 @@ constexpr const char* kDefaultLog = "/var/log/femboi-firewall.log";
 
 std::atomic<bool> g_stop{false};
 std::atomic<bool> g_reload{false};
+
+// Defined later; used by CmdDoctor and the daemon/apply paths.
+bool LoadGeoVerified(const Config& cfg, GeoDb& geo, std::string* err);
 
 // Handle process control signals
 void on_signal(int sig) {
@@ -167,6 +171,7 @@ void Usage() {
         "  list                 List active bans\n"
         "  ban <ip> [secs]      Ban IP address\n"
         "  unban <ip>           Lift ban on IP address\n"
+        "  control <request...> Talk to the running daemon control socket\n"
         "  geo <CC> <action>    Update country rule\n"
         "  set <key> <value>    Update protection setting\n"
         "  hwid                 Print machine HWID\n"
@@ -217,7 +222,7 @@ int CmdDoctor() {
     }
 
     GeoDb geo;
-    if (geo.Load(cfg.geoip_path, &err)) {
+    if (LoadGeoVerified(cfg, geo, &err)) {
         std::cout << "[ok]   geoip:        " << geo.size() << " ranges\n";
     } else {
         std::cout << "[warn] geoip:        " << err << "\n";
@@ -380,6 +385,7 @@ struct EngineState {
     AsnFilter asn;
     BanTable bans;
     Counters counters;
+    std::atomic<uint64_t> dpi_drops{0};
     std::mutex feed_mu;
     std::vector<BlockEvent> feed;
     std::atomic<bool> running{false};
@@ -407,6 +413,210 @@ struct EngineState {
         return out;
     }
 };
+
+// Escape a string for a JSON double-quoted value (control-socket responses).
+std::string EscapeJson(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (unsigned char c : in) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char)c;
+                }
+        }
+    }
+    return out;
+}
+
+std::string CtlErr(const std::string& m) {
+    return "{\"ok\":false,\"error\":\"" + EscapeJson(m) + "\"}";
+}
+
+// Parse and validate a single config key/value from the CLI or the control
+// socket. Shared so the two cannot drift. Unknown keys or bad values return
+// false without mutating `cfg`.
+bool ApplySetting(Config& cfg, const std::string& key, const std::string& value) {
+    auto pb = [&](bool* o) {
+        if (value == "1" || value == "on" || value == "true" || value == "yes") { *o = true; return true; }
+        if (value == "0" || value == "off" || value == "false" || value == "no") { *o = false; return true; }
+        return false;
+    };
+    auto pu = [&](uint32_t* o) {
+        if (value.empty()) return false;
+        for (char c : value) {
+            if (!isdigit((unsigned char)c)) return false;
+        }
+        *o = (uint32_t)strtoul(value.c_str(), nullptr, 10);
+        return true;
+    };
+
+    if (key == "enabled") return pb(&cfg.enabled);
+    if (key == "datacenter_filter") return pb(&cfg.datacenter_filter);
+    if (key == "geo_enabled") return pb(&cfg.geo_enabled);
+    if (key == "auto_ban") return pb(&cfg.auto_ban);
+    if (key == "dpi_enabled") return pb(&cfg.dpi_enabled);
+    if (key == "xdp_enabled") return pb(&cfg.xdp_enabled);
+    if (key == "ipv6_enabled") return pb(&cfg.ipv6_enabled);
+    if (key == "per_ip_pps") return pu(&cfg.per_ip_pps);
+    if (key == "rate_burst") return pu(&cfg.rate_burst);
+    if (key == "egress_udp_pps") return pu(&cfg.egress_udp_pps);
+    if (key == "ban_seconds") return pu(&cfg.ban_seconds);
+    return false;
+}
+
+// Load the GeoIP dataset through a supply-chain guard: if a sibling
+// `<geoip>.sha256` file is present, the dataset must match it byte-for-byte or
+// it is refused. This stops a tampered or partially-downloaded dataset from
+// silently changing which countries are blocked.
+bool LoadGeoVerified(const Config& cfg, GeoDb& geo, std::string* err) {
+    const std::string sum_path = cfg.geoip_path + ".sha256";
+    std::ifstream in(sum_path);
+    if (in) {
+        std::string want;
+        in >> want;
+        const std::string got = Sha256File(cfg.geoip_path);
+        if (!want.empty() && got != want) {
+            if (err) *err = "geoip checksum mismatch (refusing dataset): " + sum_path;
+            Logf(0, "geoip: checksum mismatch, refusing to load %s", cfg.geoip_path.c_str());
+            return false;
+        }
+    }
+    return geo.Load(cfg.geoip_path, err);
+}
+
+// Build the daemon-side control-socket handlers. The lambdas capture `&st`:
+// the server thread runs only while CmdDaemon's stack frame is alive.
+CtlHandlers BuildCtlHandlers(EngineState& st, std::string config_path) {
+    CtlHandlers h;
+
+    h.status = [&st]() {
+        auto cfg = st.cfg;
+        std::ostringstream s;
+        s << "{\"ok\":true"
+          << ",\"engine\":\"" << (st.running.load() ? "running" : "stopped") << "\""
+          << ",\"enabled\":" << ((cfg && cfg->enabled) ? "true" : "false")
+          << ",\"active_bans\":" << st.bans.size()
+          << ",\"xdp_enabled\":" << ((cfg && cfg->xdp_enabled) ? "true" : "false")
+          << ",\"dpi_enabled\":" << ((cfg && cfg->dpi_enabled) ? "true" : "false")
+          << ",\"ipv6_enabled\":" << ((cfg && cfg->ipv6_enabled) ? "true" : "false")
+          << ",\"machine\":\"" << EscapeJson(MachineName()) << "\""
+          << ",\"hwid\":\"" << EscapeJson(MachineHwid()) << "\""
+          << "}";
+        return s.str();
+    };
+
+    h.stats = [&st]() {
+        struct fw_stats xs;
+        memset(&xs, 0, sizeof(xs));
+        bool have_xdp = false;
+        if (st.cfg && st.cfg->xdp_enabled) {
+            XdpMaps m;
+            if (m.Open(st.cfg->xdp_pin_dir, nullptr)) have_xdp = m.ReadStats(&xs);
+        }
+        std::ostringstream s;
+        s << "{\"ok\":true"
+          << ",\"processed\":" << st.counters.processed.load()
+          << ",\"passed\":" << st.counters.passed.load()
+          << ",\"blocked\":" << st.counters.total_blocked()
+          << ",\"dpi_drops\":" << st.dpi_drops.load();
+        if (have_xdp) {
+            s << ",\"xdp\":{\"pass\":" << xs.pass
+              << ",\"bytes\":" << xs.bytes
+              << ",\"drop_blacklist\":" << xs.drop_blacklist
+              << ",\"drop_pps\":" << xs.drop_pps
+              << ",\"drop_syn\":" << xs.drop_syn
+              << ",\"drop_udp\":" << xs.drop_udp
+              << ",\"drop_icmp\":" << xs.drop_icmp
+              << ",\"drop_malformed\":" << xs.drop_malformed
+              << ",\"auto_bans\":" << xs.auto_bans << "}";
+        } else {
+            s << ",\"xdp\":null";
+        }
+        s << "}";
+        return s.str();
+    };
+
+    h.list = [&st]() {
+        const int64_t now = NowEpoch();
+        const auto rows = st.bans.Snapshot(now, 100000);
+        std::ostringstream s;
+        s << "{\"ok\":true,\"bans\":[";
+        bool first = true;
+        for (const auto& e : rows) {
+            if (!first) s << ",";
+            first = false;
+            const long long remain = e.expires_at == 0 ? 0 : (e.expires_at - now);
+            s << "{\"ip\":\"" << EscapeJson(e.ip_str) << "\""
+              << ",\"port\":" << e.port
+              << ",\"permanent\":" << (e.expires_at == 0 ? "true" : "false")
+              << ",\"expires_in\":" << remain
+              << ",\"count\":" << e.count
+              << ",\"manual\":" << (e.manual ? "true" : "false")
+              << ",\"reason\":\"" << EscapeJson(e.reason) << "\"}";
+        }
+        s << "]}";
+        return s.str();
+    };
+
+    h.ban = [&st](const std::string& ip, long long ttl, const std::string& reason) -> std::string {
+        uint32_t nip = 0;
+        if (!ParseIp(ip, &nip)) return CtlErr("invalid IPv4 address");
+        if (is_local_or_loopback_ipv4(nip) || (ntohl(nip) & 0xF0000000u) == 0xE0000000u)
+            return CtlErr("refusing to ban local/loopback/multicast address");
+        const uint32_t eff = ttl > 0 ? (uint32_t)ttl
+                                     : (st.cfg ? st.cfg->ban_seconds : 3600);
+        st.bans.Add(nip, 0, reason, (int64_t)eff, 1, true);
+        Nft nft;
+        std::string e;
+        nft.AddBan(nip, eff, &e);
+        if (st.cfg && st.cfg->xdp_enabled) {
+            XdpMaps m;
+            if (m.Open(st.cfg->xdp_pin_dir, nullptr)) m.BlockIp(nip, eff, FW_BAN_MANUAL);
+        }
+        std::ostringstream s;
+        s << "{\"ok\":true,\"ip\":\"" << EscapeJson(ip) << "\",\"ttl\":" << eff << "}";
+        return s.str();
+    };
+
+    h.unban = [&st](const std::string& ip) -> std::string {
+        uint32_t nip = 0;
+        if (!ParseIp(ip, &nip)) return CtlErr("invalid IPv4 address");
+        st.bans.Remove(nip);
+        Nft nft;
+        std::string e;
+        nft.DelBan(nip, &e);
+        if (st.cfg) {
+            XdpMaps m;
+            if (m.Open(st.cfg->xdp_pin_dir, nullptr)) m.UnblockIp(nip, nullptr);
+        }
+        return std::string("{\"ok\":true,\"ip\":\"") + EscapeJson(ip) + "\"}";
+    };
+
+    h.set = [&st, config_path](const std::string& key, const std::string& value) -> std::string {
+        if (!st.cfg) return CtlErr("no active config");
+        Config copy = *st.cfg;
+        if (!ApplySetting(copy, key, value)) return CtlErr("unknown setting or bad value: " + key);
+        std::string err;
+        if (!copy.Save(config_path, &err)) return CtlErr("save failed: " + err);
+        // Ask the daemon loop to reload so the change takes effect without an
+        // external systemctl round-trip.
+        g_reload.store(true, std::memory_order_relaxed);
+        return std::string("{\"ok\":true,\"key\":\"") + EscapeJson(key) +
+               "\",\"value\":\"" + EscapeJson(value) + "\"}";
+    };
+
+    return h;
+}
 
 // Translate the daemon config into the XDP `fw_config` block and mirror the
 // nftables ban set into the XDP blacklist.
@@ -442,6 +652,8 @@ void SyncXdp(const Config& cfg, const std::set<uint32_t>& bans) {
     c.ban_time_ns = (uint64_t)(cfg.ban_seconds ? cfg.ban_seconds : 3600) * 1000000000ull;
     c.flags = FW_FLAG_ICMP_ENABLED;
     if (cfg.auto_ban) c.flags |= FW_FLAG_AUTO_BAN;
+    // Mirror the nftables IPv6 default-deny at the datapath tier.
+    if (!cfg.ipv6_enabled) c.flags |= FW_FLAG_IPV6_DENY;
     xdp.SetConfig(c);
 
     for (const auto& p : cfg.ports) {
@@ -696,7 +908,7 @@ int CmdDaemon(Config& cfg, const std::string& config_path) {
     st.bans.Restore();
 
     std::string err;
-    if (!st.geo.Load(st.cfg->geoip_path, &err)) {
+    if (!LoadGeoVerified(*st.cfg, st.geo, &err)) {
         Logf(1, "geoip unavailable (%s)", err.c_str());
     }
 
@@ -738,11 +950,15 @@ int CmdDaemon(Config& cfg, const std::string& config_path) {
     std::vector<std::thread> workers;
     workers.emplace_back(MaintenanceThread, std::ref(st));
 
-    std::atomic<uint64_t> dpi_drops{0};
     DpiHandle dpi;
-    DpiStart(dpi, st.cfg, st.counters, dpi_drops);
+    DpiStart(dpi, st.cfg, st.counters, st.dpi_drops);
     ConntrackHandle ct;
     ConntrackStart(ct, st.cfg, st);
+
+    // Local admin control socket (no TCP). Runs until g_stop is set, then the
+    // worker join below reaps it.
+    workers.emplace_back(RunCtlServer, std::string(kCtlSockPath),
+                         BuildCtlHandlers(st, config_path), std::ref(g_stop));
 
     while (!g_stop.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -755,13 +971,13 @@ int CmdDaemon(Config& cfg, const std::string& config_path) {
             if (fresh->Load(config_path, &e2)) {
                 st.cfg = fresh;
                 // Fresh geo/datacenter data must be re-read on reload too.
-                st.geo.Load(st.cfg->geoip_path, nullptr);
+                LoadGeoVerified(*st.cfg, st.geo, nullptr);
                 st.asn.Init();
                 ApplyAll(st, true);
                 // Restart DPI/auto-ban against the new snapshot (old workers
                 // release their references on join), so toggling dpi_enabled or
                 // auto_ban takes effect.
-                DpiStart(dpi, st.cfg, st.counters, dpi_drops);
+                DpiStart(dpi, st.cfg, st.counters, st.dpi_drops);
                 ConntrackStart(ct, st.cfg, st);
             } else {
                 Logf(1, "reload failed: %s", e2.c_str());
@@ -791,36 +1007,8 @@ int CmdDaemon(Config& cfg, const std::string& config_path) {
 // Update configuration setting from CLI
 int CmdSet(Config& cfg, const std::string& config_path,
            const std::string& key, const std::string& value) {
-    auto parse_bool = [&](bool* out) {
-        if (value == "1" || value == "on" || value == "true" || value == "yes") { *out = true; return true; }
-        if (value == "0" || value == "off" || value == "false" || value == "no") { *out = false; return true; }
-        return false;
-    };
-    auto parse_uint = [&](uint32_t* out) {
-        if (value.empty()) return false;
-        for (char c : value) {
-            if (!isdigit((unsigned char)c)) return false;
-        }
-        *out = (uint32_t)strtoul(value.c_str(), nullptr, 10);
-        return true;
-    };
-
-    bool ok = false;
-    if (key == "enabled") ok = parse_bool(&cfg.enabled);
-    else if (key == "datacenter_filter") ok = parse_bool(&cfg.datacenter_filter);
-    else if (key == "geo_enabled") ok = parse_bool(&cfg.geo_enabled);
-    else if (key == "auto_ban") ok = parse_bool(&cfg.auto_ban);
-    else if (key == "dpi_enabled") ok = parse_bool(&cfg.dpi_enabled);
-    else if (key == "xdp_enabled") ok = parse_bool(&cfg.xdp_enabled);
-    else if (key == "per_ip_pps") ok = parse_uint(&cfg.per_ip_pps);
-    else if (key == "rate_burst") ok = parse_uint(&cfg.rate_burst);
-    else if (key == "ban_seconds") ok = parse_uint(&cfg.ban_seconds);
-    else {
-        std::cerr << "error: unknown setting '" << key << "'\n";
-        return 2;
-    }
-    if (!ok) {
-        std::cerr << "error: bad value '" << value << "' for " << key << "\n";
+    if (!ApplySetting(cfg, key, value)) {
+        std::cerr << "error: unknown setting or bad value: " << key << "=" << value << "\n";
         return 2;
     }
 
@@ -1046,7 +1234,7 @@ int CmdDispatch(const std::string& command, Config& cfg, const std::string& conf
         EngineState st;
         st.cfg = std::make_shared<Config>(cfg);
         st.asn.Init();
-        st.geo.Load(cfg.geoip_path, nullptr);
+        LoadGeoVerified(cfg, st.geo, nullptr);
         return ApplyAll(st, true) ? 0 : 1;
     }
     if (command == "status") {
@@ -1084,6 +1272,20 @@ int CmdDispatch(const std::string& command, Config& cfg, const std::string& conf
     }
     if (command == "daemon") {
         return CmdDaemon(cfg, config_path);
+    }
+    if (command == "control") {
+        std::string req;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (i) req += " ";
+            req += rest[i];
+        }
+        const std::string resp = CtlClientCall(kCtlSockPath, req);
+        if (resp.empty()) {
+            std::cerr << "error: daemon control socket unavailable (" << kCtlSockPath << ")\n";
+            return 1;
+        }
+        std::cout << resp << "\n";
+        return 0;
     }
     if (command == "list" || command == "ban" || command == "unban" || command == "geo") {
         return CmdAdmin(command, cfg, rest);

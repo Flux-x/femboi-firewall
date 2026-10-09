@@ -87,6 +87,11 @@ struct Config {
 
     bool datacenter_filter = true;
     bool geo_enabled = true;
+    // IPv6 policy. false (default) denies all IPv6 except loopback, essential
+    // ICMPv6 (ND/RA/PMTUD) and established/related flows — closing the audit
+    // hole where IPv6 was passed unfiltered. true applies v6 sanitisation and
+    // per-source rate limiting (whitelist honoured; geo/ban data is IPv4-only).
+    bool ipv6_enabled = false;
 
     // Trusted source addresses/CIDRs exempt from rate limits and auto-ban.
     std::vector<std::string> whitelist;
@@ -94,6 +99,9 @@ struct Config {
     uint32_t ban_seconds = 3600;
     uint32_t per_ip_pps = 400;
     uint32_t rate_burst = 800;
+    // Global outbound UDP ceiling (packets/s) toward the protected game ports.
+    // Throttles A2S reflection/amplification; 0 disables the egress guard.
+    uint32_t egress_udp_pps = 4000;
 
     // Optional userspace DPI
     bool dpi_enabled = false;

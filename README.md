@@ -112,7 +112,7 @@ sudo ./derle.sh --install
 
 ```bash
 make -C linux/gui
-sudo cp linux/gui/fw-gui /usr/local/bin/fluxxfw-gui
+sudo cp linux/gui/fw-gui /usr/local/bin/femboi-firewall-gui
 ```
 
 ### 4. Service Control
@@ -209,9 +209,14 @@ Output binaries are written to `bin/` (`femboi-firewall`, `femboi-firewall-xdp`)
   connection-layer floods on a single host. A line-saturating (Gbps) attack must
   be absorbed upstream by your provider's scrubbing/filtering — no on-box tool
   can help once the pipe is full.
-- **IPv6 is currently passed, not filtered.** The ban/geo sets are IPv4 only;
-  IPv6 (including ICMPv6 control traffic) is explicitly accepted so nothing is
-  blackholed. Full IPv6 enforcement is on the roadmap.
+- **IPv6 is denied by default, not fully managed.** With `ipv6_enabled=0`
+  (the default) all inbound IPv6 is dropped except essential ICMPv6 (neighbour
+  discovery, router advertisements, PMTU) and established flows. Setting
+  `ipv6_enabled=1` enables IPv6 with the same sanitisation and per-source rate
+  limiting, but ban/geo sets remain IPv4-only (no per-IP v6 ban storage yet).
+- **Admin access:** the daemon serves a local control socket
+  (`/run/femboi/ctl.sock`, no TCP). Add trusted operators to the `femboi` group
+  to let an unprivileged GUI drive it; otherwise run the GUI as root.
 - **Per-IP limits do not stop distributed floods.** They only constrain a single
   source; use them with, not instead of, upstream protection.
 

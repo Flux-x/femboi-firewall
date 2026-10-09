@@ -4,19 +4,23 @@
 The Linux firewall is a headless standalone daemon with CLI and XDP controls.
 This desktop app provides an operator UI for desktop/RDP sessions.
 
-It is a thin front end. Every button shells out to the same `fluxxfw` binary the
-CLI uses, so there is exactly one implementation of every action and no second
-source of truth to drift. Commands are passed as argument lists, never through a
-shell.
+It is a thin front end. Read/ban/unban go through the daemon's Unix control
+socket (`/run/femboi/ctl.sock`), so the GUI never has to run nftables itself and
+there is exactly one writer for enforcement state. Lifecycle and diagnostics
+still shell out to systemd and the `femboi-firewall` binary, passed as argument
+lists — never through a shell.
 """
 
+import json
 import os
+import socket
 import subprocess
 import sys
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-FLUXXFW = "/usr/local/bin/fluxxfw"
+FB = "/usr/local/bin/femboi-firewall"
+CTL_SOCK = "/run/femboi/ctl.sock"
 UNIT = "femboi-firewall"
 
 BG = "#14161a"
@@ -38,6 +42,39 @@ def run(args, timeout=20):
         return 124, "timed out"
     except Exception as exc:  # noqa: BLE001
         return 1, str(exc)
+
+
+def ctl(request, timeout=10):
+    """Send one request to the daemon control socket and return (ok, payload).
+
+    payload is the parsed JSON dict on success, or an error string.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(CTL_SOCK)
+            sock.sendall((request + "\n").encode("utf-8"))
+            buf = b""
+            while b"\n" not in buf and len(buf) < 65536:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+    except FileNotFoundError:
+        return False, f"control socket missing ({CTL_SOCK}); is the daemon running?"
+    except PermissionError:
+        return False, "permission denied; run the GUI as root or join the `femboi` group"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+    line = buf.split(b"\n", 1)[0].decode("utf-8", "replace")
+    try:
+        data = json.loads(line)
+    except ValueError:
+        return False, f"bad response: {line!r}"
+    if not data.get("ok", False):
+        return False, data.get("error", "unknown error")
+    return True, data
 
 
 def service_state():
@@ -137,15 +174,21 @@ class FirewallApp(tk.Tk):
             self.write(f"\n[exit {rc}]")
 
     def refresh(self):
-        if not os.path.exists(FLUXXFW):
-            self.status.configure(text="fluxxfw NOT INSTALLED", fg=ERR)
+        if not os.path.exists(FB):
+            self.status.configure(text="femboi-firewall NOT INSTALLED", fg=ERR)
             return
         state, active = service_state()
-        self.status.configure(text=f"daemon: {state}",
-                              fg=OK if active else WARN)
+        ok, data = ctl("status")
+        if ok:
+            self.status.configure(
+                text=f"daemon: {state} · {data.get('active_bans', 0)} bans · "
+                     f"xdp {'on' if data.get('xdp_enabled') else 'off'}",
+                fg=OK if active else WARN)
+        else:
+            self.status.configure(text=f"daemon: {state}", fg=OK if active else WARN)
 
-        # Ports come from the config, not from a live query: they are what the
-        # ruleset was generated from, and a failure here is worth seeing.
+        # Ports come from the config: they are what the ruleset was generated
+        # from, and a failure here is worth seeing.
         conf = "/etc/femboi/firewall.conf"
         ports = "(no config)"
         try:
@@ -177,13 +220,28 @@ class FirewallApp(tk.Tk):
         self.refresh()
 
     def apply(self):
-        self.show("apply", [FLUXXFW, "apply"])
+        self.show("apply", [FB, "apply"])
 
     def doctor(self):
-        self.show("doctor", [FLUXXFW, "doctor"])
+        self.show("doctor", [FB, "doctor"])
 
     def blocked(self):
-        self.show("list", [FLUXXFW, "list"])
+        self.clear()
+        ok, data = ctl("list")
+        if not ok:
+            self.write(f"error: {data}")
+            return
+        bans = data.get("bans", [])
+        if not bans:
+            self.write("(no active bans)")
+            return
+        self.write(f"{'ip':<18} {'remaining':<12} {'reason'}")
+        self.write("-" * 60)
+        for b in bans:
+            remain = "permanent" if b.get("permanent") else f"{b.get('expires_in', 0)}s"
+            self.write(f"{b.get('ip', ''):<18} {remain:<12} {b.get('reason', '')}")
+        self.write("-" * 60)
+        self.write(f"{len(bans)} active ban(s)")
 
     def _ip(self):
         ip = self.ip_entry.get().strip()
@@ -194,21 +252,34 @@ class FirewallApp(tk.Tk):
 
     def ban(self):
         ip = self._ip()
-        if ip:
-            self.show("ban", [FLUXXFW, "ban", ip])
+        if not ip:
+            return
+        self.clear()
+        ok, data = ctl(f"ban {ip}")
+        self.write(f"$ ctl ban {ip}")
+        self.write("-" * 60)
+        self.write(f"banned {ip} for {data.get('ttl')}s" if ok else f"error: {data}")
+        self.refresh()
 
     def unban(self):
         ip = self._ip()
-        if ip:
-            self.show("unban", [FLUXXFW, "unban", ip])
+        if not ip:
+            return
+        self.clear()
+        ok, data = ctl(f"unban {ip}")
+        self.write(f"$ ctl unban {ip}")
+        self.write("-" * 60)
+        self.write(f"unbanned {ip}" if ok else f"error: {data}")
+        self.refresh()
 
 
 def main():
     if "--check" in sys.argv:
         # Headless smoke test: catch a missing binary or a broken Tk before
         # anyone has to click anything.
-        print("fluxxfw:", "present" if os.path.exists(FLUXXFW) else "MISSING")
+        print("femboi-firewall:", "present" if os.path.exists(FB) else "MISSING")
         print("service :", service_state()[0])
+        print("ctl sock:", "present" if os.path.exists(CTL_SOCK) else "MISSING")
         try:
             import tkinter  # noqa: F401
             print("tkinter : present")
@@ -222,7 +293,7 @@ def main():
     except Exception as exc:  # noqa: BLE001
         # A GUI that dies silently when launched from a menu is unfixable by the
         # person clicking it, so say something on stderr as well.
-        print("fluxxfw-gui failed:", exc, file=sys.stderr)
+        print("femboi-firewall-gui failed:", exc, file=sys.stderr)
         raise
     return 0
 

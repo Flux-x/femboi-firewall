@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: femboi-firewall
-Source: https://github.com/FLUXXFALCON/femboi-firewall
+Source: https://github.com/Flux-x/femboi-firewall
 
 Files: *
 Copyright: 2026 Flux
