@@ -2,6 +2,7 @@
 #include "xdp_maps.hpp"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 #include <atomic>
@@ -27,8 +28,8 @@ void usage() {
     std::cout <<
         "femboi-firewall-xdp — XDP datapath control\n"
         "\n"
-        "  attach [--iface IF] [--mode drv|skb|hw] [--egress] [--obj PATH]\n"
-        "  detach [--iface IF] [--egress]\n"
+        "  attach [--iface IF] [--mode drv|skb|hw] [--obj PATH]\n"
+        "  detach [--iface IF]\n"
         "  block <ip> [seconds] [reason]\n"
         "  unblock <ip>\n"
         "  list-blocked [--limit N]\n"
@@ -93,44 +94,45 @@ std::string fmt_bytes(uint64_t b) {
     return buf;
 }
 
-// Attach XDP program to interface
+// Attach XDP program to interface.
+// NOTE: there is no XDP egress hook; the previous --egress path just loaded the
+// same program object a second time (bpftool pins the first program only), so
+// it was removed. TC egress is the correct mechanism if outbound filtering is
+// ever needed.
 int cmd_attach(const std::string& iface, const std::string& mode,
-               const std::string& obj, bool egress, std::string* err) {
+               const std::string& obj, const std::string& pin_dir,
+               std::string* err) {
     if (obj.empty() || access(obj.c_str(), R_OK) != 0) {
         *err = "BPF object not found: " + obj;
         return 1;
     }
 
+    const std::string prog_pin = pin_dir + "/prog";
+
     std::string out;
     std::vector<std::string> load = {
-        "bpftool", "prog", "load", obj, kXdpProgPin,
-        "type", "xdp", "pinmaps", kXdpPinDir,
+        "bpftool", "prog", "load", obj, prog_pin,
+        "type", "xdp", "pinmaps", pin_dir,
     };
     if (!run_argv(load, &out, err)) return 1;
-
-    if (egress) {
-        std::vector<std::string> load_eg = {
-            "bpftool", "prog", "load", obj, kXdpProgPinEgress,
-            "type", "xdp", "pinmaps", kXdpPinDir,
-        };
-        std::string ignored;
-        run_argv(load_eg, &ignored, nullptr);
-    }
 
     const std::string attach_mode =
         mode == "skb" ? "xdpgeneric" : (mode == "hw" ? "xdpoffload" : "xdpdrv");
 
     std::vector<std::string> link = {
-        "ip", "link", "set", "dev", iface, attach_mode, "pinned", kXdpProgPin,
+        "ip", "link", "set", "dev", iface, attach_mode, "pinned", prog_pin,
     };
     if (!run_argv(link, &out, err)) {
         if (attach_mode == "xdpdrv") {
             std::string ignored;
             std::vector<std::string> generic = {
-                "ip", "link", "set", "dev", iface, "xdpgeneric", "pinned", kXdpProgPin,
+                "ip", "link", "set", "dev", iface, "xdpgeneric", "pinned", prog_pin,
             };
             if (run_argv(generic, &ignored, nullptr)) {
-                std::cout << "[!] attached in generic SKB mode on " << iface << "\n";
+                // Be explicit: a silent native->generic downgrade hides a
+                // large performance regression (esp. virtio_net queues).
+                std::cout << "[!] native XDP unavailable; attached in generic SKB mode on "
+                          << iface << " (expect much lower throughput)\n";
                 return 0;
             }
         }
@@ -141,17 +143,35 @@ int cmd_attach(const std::string& iface, const std::string& mode,
     return 0;
 }
 
-// Detach XDP program from interface
-int cmd_detach(const std::string& iface, bool egress) {
+// Remove every pinned object under the pin dir so a subsequent attach does not
+// fail with EEXIST from `bpftool ... pinmaps`. Returns the number of files
+// removed. Uses opendir/readdir rather than shelling out.
+static void remove_pins(const std::string& pin_dir, int* removed) {
+    DIR* d = opendir(pin_dir.c_str());
+    if (!d) return;
+    struct dirent* ent = nullptr;
+    while ((ent = readdir(d)) != nullptr) {
+        const std::string name = ent->d_name;
+        if (name == "." || name == "..") continue;
+        if (unlink((pin_dir + "/" + name).c_str()) == 0 && removed) (*removed)++;
+    }
+    closedir(d);
+}
+
+// Detach XDP program from interface and clean up pinned maps/programs.
+int cmd_detach(const std::string& iface, const std::string& pin_dir) {
     std::string out, err;
     std::vector<std::string> link = {"ip", "link", "set", "dev", iface, "xdp", "off"};
-    if (!run_argv(link, &out, &err)) {
+    // An interface with no program attached is not an error for detach.
+    if (!run_argv(link, &out, &err) && err.find("No such") == std::string::npos &&
+        err.find("Invalid") == std::string::npos && err.find("Operation not") == std::string::npos) {
         std::cerr << "error: " << err << "\n";
         return 1;
     }
-    unlink(kXdpProgPin);
-    if (egress) unlink(kXdpProgPinEgress);
-    std::cout << "[+] detached from " << iface << "\n";
+
+    int removed = 0;
+    remove_pins(pin_dir, &removed);
+    std::cout << "[+] detached from " << iface << " (" << removed << " pins removed)\n";
     return 0;
 }
 
@@ -241,12 +261,12 @@ static int HandleDoctor(const std::string& iface, const std::string& pin_dir) {
 
 // Attach XDP program to network interface
 static int HandleAttach(const std::string& iface, const std::string& mode, const std::string& obj,
-                         bool egress, const std::string& pin_dir) {
+                         const std::string& pin_dir) {
     if (!is_root()) { std::cerr << "error: attach needs root\n"; return 1; }
-    mkdir("/sys/fs/bpf", 0755);
-    mkdir(pin_dir.c_str(), 0700);
+    // /sys/fs/bpf is mounted by systemd (bpffs); mkdir is unnecessary there.
+    ::mkdir(pin_dir.c_str(), 0700);
     std::string err;
-    const int rc = cmd_attach(iface, mode, obj, egress, &err);
+    const int rc = cmd_attach(iface, mode, obj, pin_dir, &err);
     if (rc != 0) { std::cerr << "error: " << err << "\n"; return rc; }
 
     XdpMaps maps;
@@ -259,9 +279,9 @@ static int HandleAttach(const std::string& iface, const std::string& mode, const
 }
 
 // Detach XDP program from network interface
-static int HandleDetach(const std::string& iface, bool egress) {
+static int HandleDetach(const std::string& iface, const std::string& pin_dir) {
     if (!is_root()) { std::cerr << "error: detach needs root\n"; return 1; }
-    return cmd_detach(iface, egress);
+    return cmd_detach(iface, pin_dir);
 }
 
 // Display packet rate and counter statistics
@@ -469,7 +489,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> rest;
     std::string pin_dir = kXdpPinDir;
     std::string iface, mode = "drv", obj = kDefaultObject;
-    bool egress = false, watch = false;
+    bool watch = false;
     double interval = 1.0;
     size_t limit = 500;
 
@@ -489,7 +509,6 @@ int main(int argc, char** argv) {
         else if (a == "--iface" || a == "-i") iface = need("--iface");
         else if (a == "--mode") mode = need("--mode");
         else if (a == "--obj") obj = need("--obj");
-        else if (a == "--egress") egress = true;
         else if (a == "--watch" || a == "-w") watch = true;
         else if (a == "--interval") interval = atof(need("--interval").c_str());
         else if (a == "--limit") limit = (size_t)strtoul(need("--limit").c_str(), nullptr, 10);
@@ -502,8 +521,8 @@ int main(int argc, char** argv) {
     if (iface.empty()) iface = default_iface();
 
     if (command == "doctor") return HandleDoctor(iface, pin_dir);
-    if (command == "attach") return HandleAttach(iface, mode, obj, egress, pin_dir);
-    if (command == "detach") return HandleDetach(iface, egress);
+    if (command == "attach") return HandleAttach(iface, mode, obj, pin_dir);
+    if (command == "detach") return HandleDetach(iface, pin_dir);
 
     XdpMaps maps;
     std::string err;

@@ -1,38 +1,49 @@
 # Femboi Firewall configuration
 # Location: /etc/femboi/firewall.conf
+#
+# Flat key=value format. INI-style [sections] are NOT supported. Unknown keys
+# are logged and ignored rather than silently dropped.
 
-# Master switch: 1 enabled, 0 idle
+# Master switch: 1 enabled, 0 idle.
 enabled=1
 
-# Protected ports: port/proto comma separated
+# Protected ports: port/proto comma separated (proto: tcp | udp | both).
 ports=27016/udp,27015/udp,80/tcp,443/tcp,8080/tcp
 
-# Drop traffic from datacenter and VPS ranges
+# Optional full-fidelity port table. Loaded AFTER `ports=` and overrides it.
+# slotN = port enabled type attack rate_limit speed_mbps proto
+#   type: 0 game, 1 web, 2 system
+#   rate_limit: percent of per_ip_pps (10..500)
+#   proto: 0 both, 1 tcp, 2 udp
+# slot0=27015 1 0 0 100 10000 0
+
+# Trusted sources exempt from every rate limit and auto-ban. Comma separated
+# addresses or CIDR. Add your admin/SSH origin here before exposing port 22.
+whitelist=203.0.113.7,10.0.0.0/8
+
+# Drop new inbound connections from datacenter/VPS ranges.
 datacenter_filter=1
 
-# Enable country geo-filtering
+# Enable country geo-filtering (see rules_path).
 geo_enabled=1
 
-# Enable threat intelligence feed
-cti_enabled=1
-
-# Auto-ban IPs exceeding threshold
+# Auto-ban IPs exceeding thresholds.
 auto_ban=1
 ban_seconds=3600
 
-# Per source IP rate limits
+# Per source IP rate limits.
 per_ip_pps=1000
 rate_burst=2000
 
-# Userspace DPI packet inspection
+# Userspace DPI packet inspection (requires a --with-dpi build).
 dpi_enabled=0
 dpi_queue=200
 
-# XDP datapath integration
+# XDP datapath integration.
 xdp_enabled=1
 xdp_pin_dir=/sys/fs/bpf/femboifw
 
-# Storage and rule file paths
+# Storage and rule file paths.
 geoip_path=/usr/share/femboi/geoip.dat
 rules_path=/etc/femboi/geo_rules.json
 state_dir=/var/lib/femboi

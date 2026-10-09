@@ -1,0 +1,43 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Runtime state + log directories (config lives under /etc/femboi and is
+        # shipped as a conffile so dpkg preserves operator edits).
+        install -d -m 0700 /var/lib/femboi
+        install -d -m 0755 /usr/share/femboi
+
+        # sysctl hardening drop-in (idempotent; the daemon writes its own copy
+        # at runtime, but shipping it here applies it at boot).
+        if [ ! -e /etc/sysctl.d/90-femboi.conf ]; then
+            cat > /etc/sysctl.d/90-femboi.conf <<'EOF'
+# Installed by femboi-firewall. Remove or edit to opt out.
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_max_syn_backlog = 8192
+net.core.somaxconn = 8192
+net.core.netdev_max_backlog = 16384
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.icmp_ratelimit = 100
+net.ipv4.icmp_ratemask = 6168
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+EOF
+        fi
+
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null 2>&1 || true
+            # Do not force-start on upgrade; respect the admin's enable state.
+            if [ -n "$2" ]; then
+                deb-systemd-invoke try-restart femboi-firewall.service >/dev/null 2>&1 || true
+            fi
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

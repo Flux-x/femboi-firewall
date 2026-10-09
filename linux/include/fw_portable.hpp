@@ -23,7 +23,8 @@ inline bool is_critical_exploit(const unsigned char* payload, unsigned int len) 
         payload[2] != 0xFF || payload[3] != 0xFF) {
         return false;
     }
-    if (len >= 8 && memcmp(payload + 4, "rcon", 4) == 0) return true;
+    // A bare 5-byte header (len < 5 returns above) or oversized datagram is
+    // suspicious; the old `rcon` prefix check blocked legitimate RCON setup.
     if (len > 2048) return true;
     return false;
 }
@@ -32,14 +33,22 @@ inline bool is_critical_exploit(const unsigned char* payload, unsigned int len) 
 inline PacketType parse_packet_type(const unsigned char* payload, unsigned int len) {
     if (len < 4) return PKT_GAME;
 
-    // Split packet validation
+    // Split packet validation.
+    // Wire layout (modern Source/A2S):
+    //   [0..3]  = 0xFFFFFFFE
+    //   [4..7]  = split request id
+    //   [8]     = total packet count
+    //   [9]     = current packet number (index)
+    //   [10..11]= split size (most engines)
+    // The previous code read index from byte 8 and count from byte 9, which
+    // rejected/\"exploited\" the legitimate packet #0 of every split response.
     if (payload[0] == 0xFE && payload[1] == 0xFF && payload[2] == 0xFF && payload[3] == 0xFF) {
         if (len < 12) return PKT_INVALID;
 
-        uint8_t packet_index = payload[8];
-        uint8_t packet_count = payload[9];
+        const uint8_t packet_count = payload[8];
+        const uint8_t packet_index = payload[9];
 
-        if (packet_count == 0) return PKT_EXPLOIT;
+        if (packet_count == 0) return PKT_INVALID;
         if (packet_index >= packet_count) return PKT_INVALID;
 
         return PKT_GAME;
@@ -55,12 +64,9 @@ inline PacketType parse_packet_type(const unsigned char* payload, unsigned int l
 
         unsigned char type = payload[4];
 
-        if (len >= 14) {
-            for (unsigned int i = 4; i + 10 <= len && i < 64; i++) {
-                if (memcmp(payload + i, "disconnect", 10) == 0)
-                    return PKT_DISCONNECT;
-            }
-        }
+        // Only the connectionless control byte (payload[4]) may carry a
+        // "disconnect" directive. Scanning the first 64 bytes for the literal
+        // string matched unrelated payloads and misclassified legitimate traffic.
         if (type == 'q') {
             if (len >= 15 && memcmp(payload + 5, "disconnect", 10) == 0)
                 return PKT_DISCONNECT;

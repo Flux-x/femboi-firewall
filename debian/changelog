@@ -1,0 +1,6 @@
+femboi-firewall (1.0.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging: daemon, XDP CLI, CO-RE eBPF object, systemd
+    unit, conffile, logrotate and hardening sysctl drop-in.
+
+ -- Flux <flux@users.noreply.github.com>  Fri, 09 Oct 2026 00:00:00 +0000

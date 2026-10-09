@@ -1,0 +1,34 @@
+#!/usr/bin/make -f
+# Debian build rules for femboi-firewall.
+export DH_VERBOSE = 1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Daemon + XDP CLI via the project build script.
+	bash derle.sh
+	# eBPF datapath object (CO-RE, from the running kernel's BTF).
+	$(MAKE) -C linux/xdp bpf
+
+override_dh_auto_install:
+	install -d $(CURDIR)/debian/femboi-firewall/usr/bin
+	install -m 0755 bin/femboi-firewall $(CURDIR)/debian/femboi-firewall/usr/bin/
+	install -m 0755 bin/femboi-firewall-xdp $(CURDIR)/debian/femboi-firewall/usr/bin/
+	install -d $(CURDIR)/debian/femboi-firewall/usr/lib/femboi
+	install -m 0644 bin/femboi_xdp.o $(CURDIR)/debian/femboi-firewall/usr/lib/femboi/
+	install -d $(CURDIR)/debian/femboi-firewall/lib/systemd/system
+	install -m 0644 deploy/femboi-firewall.service \
+		$(CURDIR)/debian/femboi-firewall/lib/systemd/system/
+	install -d $(CURDIR)/debian/femboi-firewall/etc/femboi
+	install -m 0644 firewall.conf.example \
+		$(CURDIR)/debian/femboi-firewall/etc/femboi/firewall.conf
+	install -d $(CURDIR)/debian/femboi-firewall/etc/logrotate.d
+	install -m 0644 deploy/femboi-firewall.logrotate \
+		$(CURDIR)/debian/femboi-firewall/etc/logrotate.d/femboi-firewall
+
+override_dh_auto_clean:
+	-$(MAKE) -C linux/xdp clean
+	-bash derle.sh --clean || true
+	dh_auto_clean

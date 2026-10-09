@@ -1,0 +1,43 @@
+[Unit]
+Description=Femboi Firewall DDoS mitigation engine
+Documentation=https://github.com/FLUXXFALCON/femboi-firewall
+# Start before the network is usable so protection exists from boot.
+After=network-pre.target
+Wants=network-pre.target
+Before=network.target
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+# Attach the XDP datapath first (best-effort: a missing object/map must not
+# block the nftables tier from starting).
+ExecStartPre=-/usr/local/bin/femboi-firewall-xdp attach
+ExecStart=/usr/local/bin/femboi-firewall daemon
+# `systemctl reload` re-reads config and rebuilds the ruleset without dropping
+# established flows.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=20s
+
+# --- Hardening ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=no
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+ReadWritePaths=/etc/femboi /var/lib/femboi /var/log /sys/fs/bpf
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN CAP_PERFMON
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN CAP_PERFMON
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

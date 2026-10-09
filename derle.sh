@@ -18,6 +18,7 @@ DEBUG=0
 DO_INSTALL=0
 DO_CLEAN=0
 CHECK_ONLY=0
+WERROR="${CXX_WERROR:-0}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -26,8 +27,9 @@ for arg in "$@"; do
         --install)  DO_INSTALL=1 ;;
         --clean)    DO_CLEAN=1 ;;
         --check)    CHECK_ONLY=1 ;;
+        --werror)   WERROR=1 ;;
         -h|--help)
-            echo "Usage: ./derle.sh [--with-dpi] [--debug] [--install] [--clean] [--check]"
+            echo "Usage: ./derle.sh [--with-dpi] [--debug] [--install] [--clean] [--check] [--werror]"
             exit 0
             ;;
         *) echo "[!] Unknown option: $arg" >&2; exit 2 ;;
@@ -90,6 +92,10 @@ LDLIBS+=(-lpthread)
 
 BASE_FLAGS=(-std=c++17 -Wall -Wextra -Wno-unused-parameter -pthread
             -I"$INC_DIR" -I"$SRC_DIR" -I"$XDP_DIR")
+if [[ "$WERROR" == "1" ]]; then
+    BASE_FLAGS+=(-Werror)
+    say "warnings are errors (-Werror)"
+fi
 if [[ "$DEBUG" -eq 1 ]]; then
     BASE_FLAGS+=(-O0 -g3 -DDEBUG -fno-omit-frame-pointer)
 else
@@ -114,7 +120,10 @@ for f in "${SOURCES[@]}"; do
     OBJECTS+=("$obj")
     printf '    %-28s' "$(basename "$f")"
 
-    if $CXX "${BASE_FLAGS[@]}" "${CFLAGS_NFQ[@]}" "${DEFINES[@]}" \
+    # `${VAR[@]+"${VAR[@]}"}` guards against `set -u` aborting when the array is
+    # empty on bash < 4.4 (DPI disabled leaves CFLAGS_NFQ/DEFINES empty).
+    if $CXX "${BASE_FLAGS[@]}" ${CFLAGS_NFQ[@]+"${CFLAGS_NFQ[@]}"} \
+            ${DEFINES[@]+"${DEFINES[@]}"} \
             -c "$f" -o "$obj" 2>"$obj.log"; then
         printf '%sok%s\n' "$c_ok" "$c_reset"
         rm -f "$obj.log"
@@ -132,7 +141,7 @@ XDP_SRC="$XDP_DIR/xdpctl.cpp"
 XDP_OBJ="$OBJ_DIR/xdpctl.o"
 [[ -f "$XDP_SRC" ]] || die "missing source: $XDP_SRC"
 printf '    %-28s' "$(basename "$XDP_SRC")"
-if $CXX "${BASE_FLAGS[@]}" "${DEFINES[@]}" \
+if $CXX "${BASE_FLAGS[@]}" ${DEFINES[@]+"${DEFINES[@]}"} \
         -c "$XDP_SRC" -o "$XDP_OBJ" 2>"$XDP_OBJ.log"; then
     printf '%sok%s\n' "$c_ok" "$c_reset"
     rm -f "$XDP_OBJ.log"
@@ -187,6 +196,33 @@ if [[ "$DO_INSTALL" -eq 1 ]]; then
         ok "Installed /etc/femboi/firewall.conf"
     fi
     chmod 0700 /var/lib/femboi
+
+    # Build and install the eBPF datapath object (CO-RE) so the systemd unit's
+    # ExecStartPre can attach it. Best-effort: a missing clang/bpftool must not
+    # fail an otherwise successful daemon install.
+    if command -v clang >/dev/null 2>&1 && command -v bpftool >/dev/null 2>&1; then
+        if make -C linux/xdp bpf >/dev/null 2>&1; then
+            install -d /usr/lib/femboi
+            if [[ -f linux/bin/femboi_xdp.o ]]; then
+                install -m 0644 linux/bin/femboi_xdp.o /usr/lib/femboi/femboi_xdp.o
+                ok "Installed /usr/lib/femboi/femboi_xdp.o"
+            fi
+        else
+            warn "XDP object build failed (attach will be skipped)"
+        fi
+    else
+        warn "clang/bpftool missing: XDP object not built"
+    fi
+
+    # Install the systemd unit (README documents `systemctl enable --now`).
+    if [[ -f deploy/femboi-firewall.service ]]; then
+        install -m 0644 deploy/femboi-firewall.service /lib/systemd/system/femboi-firewall.service
+        ok "Installed /lib/systemd/system/femboi-firewall.service"
+        command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+    else
+        warn "deploy/femboi-firewall.service missing; systemd unit not installed"
+    fi
+
     ok "Installed. Enable: systemctl enable --now femboi-firewall"
 fi
 

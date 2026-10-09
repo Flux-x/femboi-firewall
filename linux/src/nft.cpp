@@ -14,6 +14,28 @@ namespace femboifw {
 
 namespace {
 
+// Validate and canonicalise a whitelist entry (single address or CIDR).
+// Returns an empty string for malformed input so it is skipped rather than
+// being injected into the ruleset script.
+std::string FormatIpRange(const std::string& raw) {
+    std::string s = raw;
+    size_t b = s.find_first_not_of(" \t\r\n");
+    size_t e = s.find_last_not_of(" \t\r\n");
+    if (b == std::string::npos) return {};
+    s = s.substr(b, e - b + 1);
+
+    const size_t slash = s.find('/');
+    const std::string ip_part = slash == std::string::npos ? s : s.substr(0, slash);
+    struct in_addr a;
+    if (inet_pton(AF_INET, ip_part.c_str(), &a) != 1) return {};
+    if (slash == std::string::npos) return ip_part;
+
+    char* end = nullptr;
+    const long prefix = strtol(s.c_str() + slash + 1, &end, 10);
+    if (end == s.c_str() + slash + 1 || prefix < 0 || prefix > 32) return {};
+    return ip_part + "/" + std::to_string(prefix);
+}
+
 // Format IP address range string
 std::string cidr_or_range(uint32_t start_host, uint32_t end_host) {
     char buf[64];
@@ -53,13 +75,9 @@ bool Nft::RunScript(const std::string& script, std::string* out, std::string* er
     return run_argv(argv, out, err, script);
 }
 
-// Install base firewall ruleset
-bool Nft::EnsureBase(const Config& cfg, std::string* err) {
-    if (!cfg.enabled) {
-        FlushAll();
-        return true;
-    }
-
+// Build the complete nftables script for the given config without applying it.
+// Exposed so tooling/CI can validate the generated ruleset with `nft -c -f -`.
+std::string Nft::BuildScript(const Config& cfg) {
     std::ostringstream s;
 
     // Flush prior table state
@@ -68,10 +86,19 @@ bool Nft::EnsureBase(const Config& cfg, std::string* err) {
 
     s << "table " << kFamily << " " << kTable << " {\n";
 
+    // Trusted source set: never rate-limited, never auto-banned.
+    // Populated by the daemon (operator + explicitly configured admin IPs).
+    s << "  set whitelist {\n"
+         "    type ipv4_addr\n"
+         "    flags interval\n"
+         "  }\n";
+
     // Dynamic drop sets
     s << "  set banned {\n"
          "    type ipv4_addr\n"
          "    flags dynamic, timeout\n"
+         "    size 262144\n"
+         "    timeout 1h\n"
          "  }\n";
     s << "  set banned_ports {\n"
          "    type ipv4_addr . inet_service\n"
@@ -90,16 +117,22 @@ bool Nft::EnsureBase(const Config& cfg, std::string* err) {
          "    flags interval\n"
          "  }\n";
 
-    // Prerouting raw hook
+    // Prerouting raw hook.
+    // NOTE: priority -310 runs before conntrack, so only pure L3 matches are
+    // valid here. Geo/ASN filtering (which must be scoped with `ct state new`
+    // so that replies to the server's own outbound connections survive) lives
+    // in the input chain instead.
     s << "  chain prerouting {\n"
          "    type filter hook prerouting priority -310; policy accept;\n"
-         "    ip saddr @banned counter drop\n"
-         "    ip saddr . th dport @banned_ports counter drop\n"
-         "    ip saddr @geo_blocked counter drop\n"
-         "    ip saddr @dc_blocked counter drop\n"
+         "    meta nfproto ipv4 ip saddr @banned drop\n"
+         "    meta nfproto ipv4 ip saddr . th dport @banned_ports drop\n"
          "  }\n";
 
-    // Input packet filter chain
+    // Input packet filter chain.
+    // Ordering contract (see docs): hard drops -> sanity -> L7/DPI -> per-flow
+    // meters -> `ct state established,related accept` -> new-connection policy.
+    // Established traffic MUST traverse the meters/DPI, otherwise UDP flood
+    // accounting and TCP payload inspection are dead code.
     s << "  chain input {\n"
          "    type filter hook input priority -10; policy accept;\n"
          "\n"
@@ -110,13 +143,20 @@ bool Nft::EnsureBase(const Config& cfg, std::string* err) {
          "\n"
          "    iifname \"tailscale0\" accept\n"
          "\n"
+         // IPv6 is currently unmanaged by the enforcement sets (ipv4_addr).
+         // Pass it (with ICMPv6 control traffic) rather than blackholing NDP/RA.
+         "    meta nfproto ipv6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, packet-too-big } accept\n"
+         "    meta nfproto ipv6 counter accept comment \"ipv6-unmanaged\"\n"
+         "\n"
+         // Trusted sources bypass every limit and auto-ban path.
+         "    meta nfproto ipv4 ip saddr @whitelist counter accept comment \"whitelist\"\n"
+         "\n"
          "    ip saddr @banned counter drop\n"
          "    ip saddr . th dport @banned_ports counter drop\n"
-         "    ip saddr @geo_blocked counter drop\n"
-         "    ip saddr @dc_blocked counter drop\n"
-         "    ip saddr @geo_ratelimit meter m_geo_rl { ip saddr limit rate over 150/second burst 300 packets } counter drop\n"
-         "\n"
-         "    ct state established,related counter accept comment \"traffic_passed\"\n"
+         // Geo/ASN filtering applies to NEW flows only, so replies to the
+         // server's own outbound connections are never dropped.
+         "    meta nfproto ipv4 ct state new ip saddr @geo_blocked counter drop\n"
+         "    meta nfproto ipv4 ct state new ip saddr @dc_blocked counter drop\n"
          "\n"
          "    ip hdrlength > 5 counter drop\n"
          "    iifname != \"lo\" ip saddr 127.0.0.0/8 counter drop\n"
@@ -128,7 +168,13 @@ bool Nft::EnsureBase(const Config& cfg, std::string* err) {
          "\n"
          "    pkttype { broadcast, multicast } counter drop\n"
          "\n"
-         "    tcp dport { 21, 23, 25, 110, 135, 139, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200 } update @banned { ip saddr timeout 1h } counter drop\n"
+         // Sensitive management ports: never expose, and auto-ban only on a
+         // fresh SYN (ct state new), behind the whitelist. A spoofed SYN can
+         // still trigger a ban of a third-party address; operators who expose
+         // these ports must populate `whitelist`. Kept conservative: no ban
+         // storm from a single packet thanks to the meter.
+         "    tcp dport { 21, 23, 25, 110, 135, 139, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200 } ct state new meter mgmt_sweep { ip saddr limit rate over 4/minute burst 8 packets } log prefix \"femboifw mgmt-sweep \" update @banned { ip saddr timeout 1h } counter drop\n"
+         "    tcp dport { 21, 23, 25, 110, 135, 139, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200 } counter drop\n"
          "    udp dport { 137, 138, 139, 1434, 1900, 5353 } counter drop\n"
          "\n"
          "    udp sport { 17, 19, 53, 69, 111, 123, 137, 138, 161, 389, 520, 1434, 1900, 3283, 3478, 3702, 5093, 5351, 5353, 11211, 27010-27014 } ct state new counter drop\n"
@@ -144,22 +190,25 @@ bool Nft::EnsureBase(const Config& cfg, std::string* err) {
          "    tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|syn|rst|psh|ack|urg) counter drop\n"
          "    tcp flags & (fin|psh|urg) == (fin|psh|urg) counter drop\n"
          "    tcp flags & (syn|ack) == (syn|ack) ct state new counter drop\n"
-         "    tcp flags & syn == syn ip length > 120 counter drop\n"
+         // `ip length > 120` here only targets oversized bare SYNs; keep for
+         // classic SYN floods (TFO payload SYNs are rare on game/web ports).
+         "    tcp flags & syn == syn ip length > 120 ct state new counter drop\n"
          "    ip frag-off & 0x1fff != 0 counter drop\n"
          "    ip length < 28 counter drop\n"
          "\n"
          "    ct state new tcp flags & (fin|syn|rst|ack) != syn counter drop\n"
          "\n"
-         "    meter subnet24_flood { ip saddr and 255.255.255.0 limit rate over 4000/second burst 8000 packets } counter drop\n"
-         "\n"
+         // ICMP: keep essential control (PMTUD / unreachable) even when echo
+         // limiting is active, otherwise path MTU discovery breaks.
          "    ip protocol icmp icmp type { timestamp-request, timestamp-reply, address-mask-request, address-mask-reply, info-request, info-reply } counter drop\n"
-         "    ip protocol icmp icmp type echo-request meter icmp_flood { ip saddr limit rate over 2/second burst 4 packets } counter drop\n"
-         "    ip protocol icmp icmp type echo-request accept\n"
          "    ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept\n"
+         "    ip protocol icmp icmp type echo-request meter icmp_flood { ip saddr limit rate over 10/second burst 20 packets } counter drop\n"
+         "    ip protocol icmp icmp type echo-request accept\n"
          "    ip protocol icmp counter drop\n"
          "\n"
-         "    tcp dport 22 ct state new meter ssh_brute { ip saddr limit rate over 30/minute burst 50 packets } accept\n"
-         "    tcp dport 22 ct state new update @banned { ip saddr timeout 1h } counter drop\n"
+         // SSH brute force: only the meter-overflow branch is banned+dropped;
+         // normal new SSH connections fall through to accept.
+         "    tcp dport 22 ct state new meter ssh_brute { ip saddr limit rate over 30/minute burst 50 packets } update @banned { ip saddr timeout 1h } counter drop\n"
          "    tcp dport 22 accept\n";
 
     // Protected game UDP ports
@@ -255,6 +304,11 @@ bool Nft::EnsureBase(const Config& cfg, std::string* err) {
     }
 
     s << "\n"
+         // Established/related traffic is accepted only after every per-flow
+         // meter and the nfqueue DPI hook have had a chance to see it.
+         "    ip saddr @geo_ratelimit meter m_geo_rl { ip saddr limit rate over 150/second burst 300 packets } counter drop\n"
+         "    ct state established,related counter accept comment \"traffic_passed\"\n"
+         "\n"
          "    ct state new meter portscan_sweep { ip saddr limit rate over 8/second burst 12 packets } update @banned { ip saddr timeout 1h } counter drop\n"
          "\n"
          "    counter drop comment \"stealth_blackhole_drop\"\n"
@@ -266,8 +320,19 @@ bool Nft::EnsureBase(const Config& cfg, std::string* err) {
          "  }\n"
          "}\n";
 
+    return s.str();
+}
+
+// Install base firewall ruleset
+bool Nft::EnsureBase(const Config& cfg, std::string* err) {
+    if (!cfg.enabled) {
+        FlushAll();
+        return true;
+    }
+
+    const std::string script = BuildScript(cfg);
     std::string out, e;
-    if (!RunScript(s.str(), &out, &e)) {
+    if (!RunScript(script, &out, &e)) {
         if (err) *err = "nft apply failed: " + e;
         Logf(0, "EnsureBase failed: %s", e.c_str());
         return false;
@@ -278,11 +343,16 @@ bool Nft::EnsureBase(const Config& cfg, std::string* err) {
     return true;
 }
 
-// Remove entire table ruleset
+// Remove entire table ruleset.
+// `delete table` (not `destroy table`): destroy requires nft >= 1.0.8 and a new
+// enough kernel, which Debian 11/12 do not ship. A missing table is not an error.
 bool Nft::FlushAll() {
     std::string out, e;
-    if (Run({"destroy", "table", kFamily, kTable}, &out, &e)) return true;
-    if (e.find("No such file") != std::string::npos) return true;
+    if (Run({"delete", "table", kFamily, kTable}, &out, &e)) return true;
+    if (e.find("No such file") != std::string::npos ||
+        e.find("does not exist") != std::string::npos) {
+        return true;
+    }
     Logf(1, "nftables flush failed: %s", e.c_str());
     return false;
 }
@@ -325,43 +395,112 @@ bool Nft::DelBan(uint32_t ip_nbo, std::string* err) {
     return true;
 }
 
-// Synchronize complete set of active bans
+// Synchronize complete set of active bans.
+// Elements are added in bounded chunks with an explicit timeout so a large
+// ban table does not overflow the single-device netlink command size, and so
+// the kernel-side ban window mirrors the userspace expiry instead of an
+// arbitrary default. Per-element `timeout` is emitted alongside the address.
 bool Nft::SyncBanSet(const std::set<uint32_t>& ips, std::string* err) {
-    std::ostringstream s;
-    s << "flush set " << kFamily << " " << kTable << " banned\n";
-    if (!ips.empty()) {
-        s << "add element " << kFamily << " " << kTable << " banned { ";
-        bool first = true;
-        for (uint32_t ip : ips) {
-            const std::string text = FormatIp(ip);
-            if (text == "0.0.0.0") continue;
-            if (!first) s << ", ";
-            s << text;
-            first = false;
-        }
-        s << " }\n";
+    std::string out, e;
+    if (!Run({"flush", "set", kFamily, kTable, "banned"}, &out, &e)) {
+        if (err) *err = e;
+        Logf(1, "SyncBanSet flush failed: %s", e.c_str());
+        return false;
     }
 
+    const size_t kChunk = 2047;
+    std::ostringstream s;
+    size_t in_chunk = 0;
+    bool open = false;
+    for (uint32_t ip : ips) {
+        const std::string text = FormatIp(ip);
+        if (text == "0.0.0.0") continue;
+        if (!open) {
+            s << "add element " << kFamily << " " << kTable << " banned { ";
+            open = true;
+            in_chunk = 0;
+        } else {
+            s << ", ";
+        }
+        s << text << " timeout 1h";
+        if (++in_chunk >= kChunk) {
+            s << " }\n";
+            open = false;
+        }
+    }
+    if (open) s << " }\n";
+
+    if (!ips.empty() || !s.str().empty()) {
+        if (!RunScript(s.str(), &out, &e)) {
+            if (err) *err = e;
+            Logf(1, "SyncBanSet failed: %s", e.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+// Synchronize the trusted-source set. Ranges are CIDR/address strings.
+bool Nft::SyncWhitelist(const std::vector<std::string>& entries, std::string* err) {
     std::string out, e;
+    if (!Run({"flush", "set", kFamily, kTable, "whitelist"}, &out, &e)) {
+        // A missing set means the base ruleset is not installed yet; not fatal.
+        if (e.find("No such file") == std::string::npos &&
+            e.find("does not exist") == std::string::npos) {
+            if (err) *err = e;
+            return false;
+        }
+    }
+    if (entries.empty()) return true;
+
+    std::ostringstream s;
+    s << "add element " << kFamily << " " << kTable << " whitelist { ";
+    bool first = true;
+    for (const auto& raw : entries) {
+        const std::string text = FormatIpRange(raw);
+        if (text.empty()) continue;
+        if (!first) s << ", ";
+        s << text;
+        first = false;
+    }
+    s << " }\n";
+    if (first) return true;
+
     if (!RunScript(s.str(), &out, &e)) {
         if (err) *err = e;
-        Logf(1, "SyncBanSet failed: %s", e.c_str());
         return false;
     }
     return true;
 }
 
-// Populate geo-blocked IP ranges
-bool Nft::SetGeoBlocks(const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
-                       std::string* err) {
-    std::ostringstream s;
-    s << "flush set " << kFamily << " " << kTable << " geo_blocked\n";
+namespace {
 
+// Fill a CIDR/range set in bounded chunks. Shared by the geo/dc helpers so a
+// schema or formatting change cannot drift between them.
+// `fail_closed`: when true and the flush fails for reasons other than a
+// missing set, the range load is aborted and reported rather than silently
+// leaving a partially populated (or empty) set protecting the host.
+bool fill_range_set(const std::string& set_name,
+                    const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
+                    std::string* err) {
+    std::string out, e;
+    if (!Nft::Run({"flush", "set", Nft::kFamily, Nft::kTable, set_name}, &out, &e)) {
+        if (e.find("No such file") == std::string::npos &&
+            e.find("does not exist") == std::string::npos) {
+            if (err) *err = "flush set " + set_name + ": " + e;
+            Logf(1, "%s", err ? err->c_str() : "flush failed");
+            return false;
+        }
+    }
+
+    const size_t kChunk = 2047;
+    std::ostringstream s;
     size_t chunk = 0;
     bool open = false;
     for (const auto& r : ranges) {
         if (!open) {
-            s << "add element " << kFamily << " " << kTable << " geo_blocked { ";
+            s << "add element " << Nft::kFamily << " " << Nft::kTable << " "
+              << set_name << " { ";
             open = true;
             chunk = 0;
         } else {
@@ -369,19 +508,28 @@ bool Nft::SetGeoBlocks(const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
             chunk++;
         }
         s << cidr_or_range(r.first, r.second);
-        if (chunk >= 2047) {
+        if (chunk >= kChunk) {
             s << " }\n";
             open = false;
         }
     }
     if (open) s << " }\n";
 
-    std::string out, e;
-    if (!RunScript(s.str(), &out, &e)) {
+    if (ranges.empty()) return true;
+    if (!Nft::RunScript(s.str(), &out, &e)) {
         if (err) *err = e;
-        Logf(1, "SetGeoBlocks failed: %s", e.c_str());
+        Logf(1, "fill set %s failed: %s", set_name.c_str(), e.c_str());
         return false;
     }
+    return true;
+}
+
+} // namespace
+
+// Populate geo-blocked IP ranges
+bool Nft::SetGeoBlocks(const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
+                       std::string* err) {
+    if (!fill_range_set("geo_blocked", ranges, err)) return false;
     Logf(2, "nftables: %zu geo ranges loaded", ranges.size());
     return true;
 }
@@ -389,34 +537,7 @@ bool Nft::SetGeoBlocks(const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
 // Populate geo rate-limited IP ranges
 bool Nft::SetGeoRateLimits(const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
                            std::string* err) {
-    std::ostringstream s;
-    s << "flush set " << kFamily << " " << kTable << " geo_ratelimit\n";
-
-    size_t chunk = 0;
-    bool open = false;
-    for (const auto& r : ranges) {
-        if (!open) {
-            s << "add element " << kFamily << " " << kTable << " geo_ratelimit { ";
-            open = true;
-            chunk = 0;
-        } else {
-            s << ", ";
-            chunk++;
-        }
-        s << cidr_or_range(r.first, r.second);
-        if (chunk >= 2047) {
-            s << " }\n";
-            open = false;
-        }
-    }
-    if (open) s << " }\n";
-
-    std::string out, e;
-    if (!RunScript(s.str(), &out, &e)) {
-        if (err) *err = e;
-        Logf(1, "SetGeoRateLimits failed: %s", e.c_str());
-        return false;
-    }
+    if (!fill_range_set("geo_ratelimit", ranges, err)) return false;
     Logf(2, "nftables: %zu geo rate-limit ranges loaded", ranges.size());
     return true;
 }
@@ -424,34 +545,7 @@ bool Nft::SetGeoRateLimits(const std::vector<std::pair<uint32_t, uint32_t>>& ran
 // Populate datacenter blocked IP ranges
 bool Nft::SetDatacenterBlocks(const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
                               std::string* err) {
-    std::ostringstream s;
-    s << "flush set " << kFamily << " " << kTable << " dc_blocked\n";
-
-    size_t chunk = 0;
-    bool open = false;
-    for (const auto& r : ranges) {
-        if (!open) {
-            s << "add element " << kFamily << " " << kTable << " dc_blocked { ";
-            open = true;
-            chunk = 0;
-        } else {
-            s << ", ";
-            chunk++;
-        }
-        s << cidr_or_range(r.first, r.second);
-        if (chunk >= 2047) {
-            s << " }\n";
-            open = false;
-        }
-    }
-    if (open) s << " }\n";
-
-    std::string out, e;
-    if (!RunScript(s.str(), &out, &e)) {
-        if (err) *err = e;
-        Logf(1, "SetDatacenterBlocks failed: %s", e.c_str());
-        return false;
-    }
+    if (!fill_range_set("dc_blocked", ranges, err)) return false;
     Logf(2, "nftables: %zu datacenter ranges loaded", ranges.size());
     return true;
 }

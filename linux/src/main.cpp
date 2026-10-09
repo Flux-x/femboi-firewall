@@ -126,13 +126,6 @@ BuildGeoRateRanges(const GeoDb& db, const std::map<std::string, CountryRule>& ru
     return merged;
 }
 
-// Configure traffic control netem latency
-void EnsureTcLatency() {
-    system("modprobe sch_netem 2>/dev/null");
-    system("tc qdisc replace dev ens192 parent 1:3 handle 30: netem delay 45ms 6ms 2>/dev/null");
-    system("tc filter replace dev ens192 protocol ip parent 1:0 prio 1 handle 0x42 fw flowid 1:3 2>/dev/null");
-}
-
 // Build list of blocked country ranges
 std::vector<std::pair<uint32_t, uint32_t>>
 BuildGeoBlockRanges(const GeoDb& db, const std::map<std::string, CountryRule>& rules) {
@@ -170,6 +163,7 @@ void Usage() {
         "  apply  [-c FILE]     Install nftables ruleset\n"
         "  status [-c FILE]     Print firewall status JSON\n"
         "  ports  [-c FILE]     Print configured ports\n"
+        "  ruleset [-c FILE]    Print generated nftables script (dry-run with nft -c)\n"
         "  list                 List active bans\n"
         "  ban <ip> [secs]      Ban IP address\n"
         "  unban <ip>           Lift ban on IP address\n"
@@ -238,24 +232,62 @@ int CmdDoctor() {
     return problems == 0 ? 0 : 1;
 }
 
-// Count banned elements in kernel
-size_t CountBannedElements() {
+// Count banned elements in the kernel set.
+// Uses `nft -j` (JSON) rather than scraping the human-readable set dump: the
+// text form wraps the first element onto the `elements = {` line, so a naive
+// line scan undercounts by one and miscounts multi-element rows.
+struct NftBanRow {
+    std::string ip;
+    std::string remaining;
+};
+
+// Minimal scan of `nft -j` output for set element objects. Each element is a
+// `{"elem":{"val":"<ip>","expires":<secs>,...}}` entry.
+std::vector<NftBanRow> ParseBanJson(const std::string& json) {
+    std::vector<NftBanRow> rows;
+    size_t pos = 0;
+    while ((pos = json.find("\"elem\"", pos)) != std::string::npos) {
+        size_t obj = json.find('{', pos);
+        if (obj == std::string::npos) break;
+        size_t val = json.find("\"val\"", obj);
+        if (val == std::string::npos) break;
+        size_t q1 = json.find('"', val + 5);
+        size_t q2 = q1 == std::string::npos ? std::string::npos : json.find('"', q1 + 1);
+        if (q1 == std::string::npos || q2 == std::string::npos) break;
+        NftBanRow row;
+        row.ip = json.substr(q1 + 1, q2 - q1 - 1);
+        row.remaining = "permanent";
+        const size_t exp = json.find("\"expires\"", q2);
+        const size_t next = json.find("\"elem\"", q2);
+        if (exp != std::string::npos && (next == std::string::npos || exp < next)) {
+            size_t colon = json.find(':', exp);
+            if (colon != std::string::npos) {
+                size_t s = colon + 1;
+                while (s < json.size() && (json[s] == ' ' || json[s] == '\t')) s++;
+                size_t e = s;
+                while (e < json.size() && isdigit((unsigned char)json[e])) e++;
+                if (e > s) row.remaining = json.substr(s, e - s) + "s";
+            }
+        }
+        rows.push_back(std::move(row));
+        pos = q2 + 1;
+    }
+    return rows;
+}
+
+std::vector<NftBanRow> ListBansJson() {
     std::string out, err;
-    if (!Nft::Run({"list", "set", Nft::kFamily, Nft::kTable, "banned"}, &out, &err)) {
-        return 0;
+    if (!Nft::Run({"list", "set", Nft::kFamily, Nft::kTable, "banned", "-j"}, &out, &err)) {
+        // Fallback for nft builds without -j support.
+        if (!Nft::Run({"list", "set", Nft::kFamily, Nft::kTable, "banned"}, &out, &err)) {
+            return {};
+        }
     }
-    size_t count = 0;
-    std::istringstream stream(out);
-    std::string line;
-    while (std::getline(stream, line)) {
-        const size_t b = line.find_first_not_of(" \t\n\r");
-        if (b == std::string::npos) continue;
-        const std::string t = line.substr(b);
-        if (!std::isdigit((unsigned char)t[0])) continue;
-        if (t.find('.') == std::string::npos) continue;
-        count++;
-    }
-    return count;
+    return ParseBanJson(out);
+}
+
+size_t CountBannedElements() {
+    return ListBansJson().size();
 }
 
 // Print status in JSON format
@@ -274,8 +306,6 @@ int CmdStatus(const Config& cfg, const BanTable& bans, bool engine_up) {
     std::cout << "  \"model\": \"nftables\",\n";
     std::cout << "  \"hwid\": \"" << MachineHwid() << "\",\n";
     std::cout << "  \"machine_name\": \"" << MachineName() << "\",\n";
-    std::cout << "  \"licensed\": true,\n";
-    std::cout << "  \"mode\": \"standalone_open_source\",\n";
     std::cout << "  \"nft_table_present\": " << (!ruleset.empty() ? "true" : "false") << ",\n";
     std::cout << "  \"active_bans\": " << live_bans << ",\n";
 
@@ -313,11 +343,12 @@ int CmdPorts(const Config& cfg) {
     return 0;
 }
 
-// List active IP bans
+// List active IP bans (JSON-backed, see ListBansJson).
 int CmdList(const Config& cfg) {
     (void)cfg;
-    std::string out, err;
-    if (!Nft::Run({"list", "set", Nft::kFamily, Nft::kTable, "banned"}, &out, &err)) {
+    std::string err;
+    Nft nft;
+    if (nft.Dump(&err).empty()) {
         if (err.find("No such file") != std::string::npos ||
             err.find("does not exist") != std::string::npos) {
             std::cout << "Firewall table not installed.\n";
@@ -327,38 +358,16 @@ int CmdList(const Config& cfg) {
         return 1;
     }
 
-    size_t count = 0;
-    std::istringstream stream(out);
-    std::string line;
+    const auto rows = ListBansJson();
     std::cout << "ip                remaining   \n";
     std::cout << "---------------------------------\n";
-    while (std::getline(stream, line)) {
-        const size_t b = line.find_first_not_of(" \t\n\r");
-        if (b == std::string::npos) continue;
-        const std::string t = line.substr(b);
-        if (!std::isdigit((unsigned char)t[0])) continue;
-        if (t.find('.') == std::string::npos) continue;
-
-        std::string ip = t.substr(0, t.find_first_of(" \t\n\r"));
-        std::string remaining = "-";
-        const size_t exp = t.find("expires");
-        if (exp != std::string::npos) {
-            size_t s = t.find_first_not_of(" \t", exp + 7);
-            if (s != std::string::npos) {
-                size_t e = t.find_first_of(" \t\n\r", s);
-                remaining = t.substr(s, e == std::string::npos ? std::string::npos : e - s);
-            }
-        } else {
-            remaining = "permanent";
-        }
-
-        char row[128];
-        snprintf(row, sizeof(row), "%-17s %s", ip.c_str(), remaining.c_str());
-        std::cout << row << "\n";
-        count++;
+    for (const auto& r : rows) {
+        char line[128];
+        snprintf(line, sizeof(line), "%-17s %s", r.ip.c_str(), r.remaining.c_str());
+        std::cout << line << "\n";
     }
-    if (count == 0) std::cout << "(no active bans)\n";
-    else std::cout << "---------------------------------\n" << count << " active ban(s)\n";
+    if (rows.empty()) std::cout << "(no active bans)\n";
+    else std::cout << "---------------------------------\n" << rows.size() << " active ban(s)\n";
     return 0;
 }
 
@@ -396,8 +405,14 @@ struct EngineState {
     }
 };
 
-// Sync bans to pinned XDP maps
-void MirrorToXdp(const Config& cfg, const std::set<uint32_t>& bans) {
+// Translate the daemon config into the XDP `fw_config` block and mirror the
+// nftables ban set into the XDP blacklist.
+//
+// Contract (fixes split-brain): userspace is additive only here. Entries that
+// exist in XDP but not in the nft set are XDP's own auto-bans and MUST NOT be
+// deleted from here, otherwise every reload wipes live datapath bans. Explicit
+// removal happens in `unban`/`nft-flush`, which clear both tiers.
+void SyncXdp(const Config& cfg, const std::set<uint32_t>& bans) {
     if (!cfg.xdp_enabled) return;
 
     static bool warned = false;
@@ -410,6 +425,21 @@ void MirrorToXdp(const Config& cfg, const std::set<uint32_t>& bans) {
         }
         return;
     }
+
+    // Config -> fw_cfg mapping. syn/udp/icmp limits are derived from the single
+    // per-IP budget (there is no separate config surface for them yet).
+    struct fw_config c;
+    memset(&c, 0, sizeof(c));
+    c.enabled = cfg.enabled ? 1u : 0u;
+    c.pps_limit = cfg.per_ip_pps;
+    c.syn_limit = cfg.per_ip_pps / 4u;
+    c.udp_limit = cfg.per_ip_pps;
+    c.icmp_limit = 20u;
+    c.window_ns = 1000000000ull;
+    c.ban_time_ns = (uint64_t)(cfg.ban_seconds ? cfg.ban_seconds : 3600) * 1000000000ull;
+    c.flags = FW_FLAG_ICMP_ENABLED;
+    if (cfg.auto_ban) c.flags |= FW_FLAG_AUTO_BAN;
+    xdp.SetConfig(c);
 
     for (const auto& p : cfg.ports) {
         if (p.port == 0) continue;
@@ -425,50 +455,65 @@ void MirrorToXdp(const Config& cfg, const std::set<uint32_t>& bans) {
     std::set<uint32_t> present;
     for (const auto& row : xdp.ListBlocked(200000)) present.insert(row.ip_nbo);
 
-    size_t added = 0, removed = 0;
+    size_t added = 0;
+    const uint32_t ttl = cfg.ban_seconds ? cfg.ban_seconds : 3600;
     for (uint32_t ip : bans) {
         if (present.count(ip)) continue;
-        if (xdp.BlockIp(ip, 0, FW_BAN_MANUAL)) added++;
-    }
-    for (uint32_t ip : present) {
-        if (bans.count(ip)) continue;
-        if (xdp.UnblockIp(ip)) removed++;
+        if (xdp.BlockIp(ip, ttl, FW_BAN_MANUAL)) added++;
     }
 
-    if (added || removed) {
-        Logf(3, "xdp mirror: +%zu -%zu (total %zu)", added, removed, bans.size());
+    if (added) {
+        Logf(3, "xdp mirror: +%zu (nft set %zu)", added, bans.size());
     }
 }
 
-// Configure network kernel parameters
-void TuneKernelSysctl() {
-    auto write_sysctl = [](const char* path, const char* val) {
-        int fd = open(path, O_WRONLY);
-        if (fd >= 0) {
-            ssize_t w = write(fd, val, strlen(val));
-            (void)w;
-            close(fd);
-        }
-    };
-    write_sysctl("/proc/sys/net/ipv4/tcp_syncookies", "1\n");
-    write_sysctl("/proc/sys/net/ipv4/tcp_rfc1337", "1\n");
-    write_sysctl("/proc/sys/net/ipv4/tcp_max_syn_backlog", "8192\n");
-    write_sysctl("/proc/sys/net/core/somaxconn", "8192\n");
-    write_sysctl("/proc/sys/net/core/netdev_max_backlog", "16384\n");
-    write_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n");
-    write_sysctl("/proc/sys/net/ipv4/conf/default/rp_filter", "1\n");
-    write_sysctl("/proc/sys/net/ipv4/icmp_echo_ignore_broadcasts", "1\n");
-    write_sysctl("/proc/sys/net/ipv4/icmp_ignore_bogus_error_responses", "1\n");
-    write_sysctl("/proc/sys/net/ipv4/icmp_ratelimit", "100\n");
-    write_sysctl("/proc/sys/net/ipv4/icmp_ratemask", "6168\n");
-    write_sysctl("/proc/sys/net/ipv4/tcp_fin_timeout", "15\n");
-    write_sysctl("/proc/sys/net/ipv4/conf/all/accept_redirects", "0\n");
-    write_sysctl("/proc/sys/net/ipv4/conf/all/send_redirects", "0\n");
+// Emit the hardening sysctls to /etc/sysctl.d/90-femboi.conf instead of
+// writing /proc/sys on every apply. Writing runtime values clobbered
+// operator-chosen tuning (rp_filter=1 breaks WireGuard/Tailscale/Docker
+// asymmetric routing) with no way to revert. The file is idempotent and is
+// picked up by systemd-sysctl; operators can override or remove it.
+void WriteSysctlDropIn() {
+    const char* kPath = "/etc/sysctl.d/90-femboi.conf";
+    const std::string body =
+        "# Installed by femboi-firewall. Remove or edit to opt out.\n"
+        "net.ipv4.tcp_syncookies = 1\n"
+        "net.ipv4.tcp_rfc1337 = 1\n"
+        "net.ipv4.tcp_max_syn_backlog = 8192\n"
+        "net.core.somaxconn = 8192\n"
+        "net.core.netdev_max_backlog = 16384\n"
+        "net.ipv4.icmp_echo_ignore_broadcasts = 1\n"
+        "net.ipv4.icmp_ignore_bogus_error_responses = 1\n"
+        "net.ipv4.icmp_ratelimit = 100\n"
+        "net.ipv4.icmp_ratemask = 6168\n"
+        "net.ipv4.tcp_fin_timeout = 15\n"
+        "net.ipv4.conf.all.accept_redirects = 0\n"
+        "net.ipv4.conf.all.send_redirects = 0\n"
+        // NOTE: rp_filter is intentionally NOT set here.
+        ;
+
+    std::ifstream existing(kPath);
+    std::stringstream cur;
+    cur << existing.rdbuf();
+    if (cur.str() == body) return;
+
+    std::ofstream out(kPath, std::ios::trunc);
+    if (!out) {
+        Logf(1, "cannot write %s (sysctl hardening skipped)", kPath);
+        return;
+    }
+    out << body;
+    if (!out) Logf(1, "sysctl drop-in write failed: %s", kPath);
+}
+
+// Apply the sysctl drop-in at most once per daemon run before rules install.
+void EnsureSysctlDropIn() {
+    static std::once_flag once;
+    std::call_once(once, WriteSysctlDropIn);
 }
 
 // Apply configuration and rulesets to kernel
 bool ApplyAll(EngineState& st, bool log_it) {
-    TuneKernelSysctl();
+    EnsureSysctlDropIn();
     std::string err;
     Nft nft;
 
@@ -477,6 +522,13 @@ bool ApplyAll(EngineState& st, bool log_it) {
         return false;
     }
 
+    // Trusted sources must be installed before any auto-ban rule can fire.
+    if (!nft.SyncWhitelist(st.cfg.whitelist, &err)) {
+        Logf(1, "cannot sync whitelist: %s", err.c_str());
+    }
+
+    // Preserve kernel-side bans (CLI `ban`, previously written elements) across
+    // reloads; only add entries that userspace knows about.
     const auto active = st.bans.ActiveSet(NowEpoch());
     if (!nft.SyncBanSet(active, &err)) {
         Logf(1, "cannot sync ban set: %s", err.c_str());
@@ -495,7 +547,6 @@ bool ApplyAll(EngineState& st, bool log_it) {
         nft.SetGeoBlocks(ranges, &err);
         const auto rate_ranges = BuildGeoRateRanges(st.geo, rules);
         nft.SetGeoRateLimits(rate_ranges, &err);
-        EnsureTcLatency();
     } else {
         nft.SetGeoBlocks({}, &err);
         nft.SetGeoRateLimits({}, &err);
@@ -506,7 +557,7 @@ bool ApplyAll(EngineState& st, bool log_it) {
              active.size(), st.geo.size(), st.asn.range_count());
     }
 
-    MirrorToXdp(st.cfg, active);
+    SyncXdp(st.cfg, active);
     return true;
 }
 
@@ -531,7 +582,7 @@ void MaintenanceThread(EngineState& st) {
 }
 
 // Run main daemon loop
-int CmdDaemon(Config& cfg) {
+int CmdDaemon(Config& cfg, const std::string& config_path) {
     if (geteuid() != 0) {
         Logf(0, "daemon requires root");
         return 1;
@@ -553,10 +604,26 @@ int CmdDaemon(Config& cfg) {
     InstallSignals();
 
     if (!cfg.enabled) {
-        Logf(1, "config disabled");
-        while (!g_stop.load()) std::this_thread::sleep_for(std::chrono::seconds(1));
-        Nft().FlushAll();
-        return 0;
+        // Stay resident and respond to SIGHUP so `set enabled 1` (which triggers
+        // a reload) actually takes effect without a manual restart.
+        Logf(1, "config disabled; waiting for reload");
+        while (!g_stop.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (g_reload.exchange(false)) {
+                Config fresh = st.cfg;
+                std::string e2;
+                if (fresh.Load(config_path, &e2)) {
+                    st.cfg = fresh;
+                    if (st.cfg.enabled) {
+                        Logf(2, "enabled via reload");
+                        break;
+                    }
+                } else {
+                    Logf(1, "reload failed: %s", e2.c_str());
+                }
+            }
+        }
+        if (g_stop.load()) return 0;
     }
 
     if (!ApplyAll(st, true)) {
@@ -589,8 +656,13 @@ int CmdDaemon(Config& cfg) {
             Logf(2, "SIGHUP received, reloading config");
             Config fresh = st.cfg;
             std::string e2;
-            if (fresh.Load(kDefaultConfig, &e2)) {
+            // Reload the path the daemon was started with, not the hardcoded
+            // default, so `-c FILE` keeps working across reloads.
+            if (fresh.Load(config_path, &e2)) {
                 st.cfg = fresh;
+                // Fresh geo/datacenter data must be re-read on reload too.
+                st.geo.Load(st.cfg.geoip_path, nullptr);
+                st.asn.Init();
                 ApplyAll(st, true);
             } else {
                 Logf(1, "reload failed: %s", e2.c_str());
@@ -605,8 +677,11 @@ int CmdDaemon(Config& cfg) {
     }
     st.running.store(false);
 
-    Nft().FlushAll();
-    Logf(2, "clean exit");
+    // Shutdown policy: leave the installed ruleset in place so protection is
+    // continuous across `systemctl restart` and daemon crashes. The ruleset is
+    // intentionally torn down only by an explicit `nft-flush` or `systemctl stop`
+    // ExecStopPost. This avoids the restart/reload protection gap.
+    Logf(2, "clean exit (ruleset retained)");
     return 0;
 }
 
@@ -633,7 +708,6 @@ int CmdSet(Config& cfg, const std::string& config_path,
     if (key == "enabled") ok = parse_bool(&cfg.enabled);
     else if (key == "datacenter_filter") ok = parse_bool(&cfg.datacenter_filter);
     else if (key == "geo_enabled") ok = parse_bool(&cfg.geo_enabled);
-    else if (key == "cti_enabled") ok = parse_bool(&cfg.cti_enabled);
     else if (key == "auto_ban") ok = parse_bool(&cfg.auto_ban);
     else if (key == "dpi_enabled") ok = parse_bool(&cfg.dpi_enabled);
     else if (key == "xdp_enabled") ok = parse_bool(&cfg.xdp_enabled);
@@ -670,8 +744,10 @@ bool IsSafeConfigPath(const std::string& path) {
     if (path.empty() || path.size() > 4096) return false;
     if (path.find('\0') != std::string::npos || path.find("..") != std::string::npos) return false;
     for (char c : path) {
+        // Backslash is rejected: this is Linux-only, and allowing it lets path
+        // separators on non-POSIX tooling slip through validation.
         if (!std::isalnum(static_cast<unsigned char>(c)) &&
-            c != '/' && c != '.' && c != '-' && c != '_' && c != '\\') {
+            c != '/' && c != '.' && c != '-' && c != '_') {
             return false;
         }
     }
@@ -694,7 +770,31 @@ int CmdBan(const Config& cfg, const std::vector<std::string>& rest) {
         std::cerr << "error: invalid IPv4 address: " << rest[0] << "\n";
         return 2;
     }
-    const int64_t ttl = rest.size() > 1 ? strtoll(rest[1].c_str(), nullptr, 10) : cfg.ban_seconds;
+    // Refuse to blackhole loopback, link-local, multicast or the host's own
+    // routable addresses: a fat-fingered ban must not lock the operator out.
+    if (is_local_or_loopback_ipv4(ip) || (ntohl(ip) & 0xF0000000u) == 0xE0000000u) {
+        std::cerr << "error: refusing to ban local/loopback/multicast address "
+                  << FormatIp(ip) << "\n";
+        return 2;
+    }
+
+    // `ban <ip> permanent` is the only way to request a permanent ban; a bare
+    // zero or a negative duration is rejected rather than silently meaning
+    // "permanent".
+    int64_t ttl = cfg.ban_seconds;
+    if (rest.size() > 1) {
+        if (rest[1] == "permanent") {
+            ttl = 0;
+        } else {
+            char* end = nullptr;
+            ttl = strtoll(rest[1].c_str(), &end, 10);
+            if (end == rest[1].c_str() || ttl <= 0) {
+                std::cerr << "error: duration must be a positive number of seconds "
+                             "(or `permanent`)\n";
+                return 2;
+            }
+        }
+    }
     const std::string reason = rest.size() > 2 ? rest[2] : "manual";
 
     Nft nft;
@@ -727,6 +827,11 @@ int CmdUnban(const std::vector<std::string>& rest) {
     Nft nft;
     std::string e2;
     nft.DelBan(ip, &e2);
+    // Clear both enforcement tiers so a manual unban is immediate and durable.
+    XdpMaps xdp;
+    if (xdp.Open(kXdpPinDir, nullptr)) {
+        xdp.UnblockIp(ip, nullptr);
+    }
     std::cout << "unbanned " << FormatIp(ip) << "\n";
     return 0;
 }
@@ -831,10 +936,22 @@ int CmdDispatch(const std::string& command, Config& cfg, const std::string& conf
         return ApplyAll(st, true) ? 0 : 1;
     }
     if (command == "status") {
-        return CmdStatus(cfg, BanTable{}, false);
+        // Report the real enforcement state: the table is present iff a ruleset
+        // is installed, which is what "engine running" means here.
+        Nft probe;
+        std::string perr;
+        const bool up = cfg.enabled && !probe.Dump(&perr).empty();
+        return CmdStatus(cfg, BanTable{}, up);
     }
     if (command == "ports") {
         return CmdPorts(cfg);
+    }
+    if (command == "ruleset") {
+        // Print the generated nftables script so it can be validated with
+        // `nft -c -f -` (dry-run) in CI or by an operator before applying.
+        Nft nft;
+        std::cout << nft.BuildScript(cfg);
+        return 0;
     }
     if (command == "set") {
         if (rest.size() < 2) {
@@ -848,7 +965,7 @@ int CmdDispatch(const std::string& command, Config& cfg, const std::string& conf
         return CmdSet(cfg, config_path, rest[0], rest[1]);
     }
     if (command == "daemon") {
-        return CmdDaemon(cfg);
+        return CmdDaemon(cfg, config_path);
     }
     if (command == "list" || command == "ban" || command == "unban" || command == "geo") {
         return CmdAdmin(command, cfg, rest);

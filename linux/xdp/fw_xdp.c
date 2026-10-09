@@ -68,12 +68,14 @@ static __always_inline struct fw_config *get_config(void)
 	return bpf_map_lookup_elem(&fw_cfg, &zero);
 }
 
-// Drop packet and update drop counter
-#define DROP_COUNT(st, field, bytes)                      \
+// Drop packet and update drop counter.
+// The byte-count parameter is named `pkt_bytes` (not `bytes`) so it cannot
+// collide with the struct field read on the following line.
+#define DROP_COUNT(st, field, pkt_bytes)                  \
 	do {                                             \
 		if (st) {                                \
 			(st)->field++;                   \
-			(st)->bytes += (bytes);          \
+			(st)->bytes += (pkt_bytes);      \
 		}                                        \
 		return XDP_DROP;                         \
 	} while (0)
@@ -128,7 +130,11 @@ int xdp_fw(struct xdp_md *ctx)
 	if (ihl < 20u || (void *)ip + ihl > data_end)
 		DROP_COUNT(st, drop_malformed, bytes);
 
-	if (bpf_ntohs(ip->tot_len) < ihl)
+	// tot_len must be sane and must not claim more than the frame carries
+	// (truncated / lying headers are a common evasion).
+	const __u16 tot_len = bpf_ntohs(ip->tot_len);
+	const __u64 frame_l3 = (__u64)(data_end - (void *)ip);
+	if (tot_len < ihl || (__u64)tot_len > frame_l3)
 		DROP_COUNT(st, drop_malformed, bytes);
 
 	struct fw_config *cfg = get_config();
@@ -144,7 +150,7 @@ int xdp_fw(struct xdp_md *ctx)
 	struct fw_ban_value *ban = bpf_map_lookup_elem(&blacklist, &saddr);
 	if (ban) {
 		if (ban->expires_ns == 0 || ban->expires_ns > now) {
-			ban->hits++;
+			__sync_fetch_and_add(&ban->hits, 1);
 			DROP_COUNT(st, drop_blacklist, bytes);
 		}
 		bpf_map_delete_elem(&blacklist, &saddr);
@@ -163,11 +169,19 @@ int xdp_fw(struct xdp_md *ctx)
 			struct tcphdr *tcp = l4;
 			if ((void *)(tcp + 1) > data_end)
 				DROP_COUNT(st, drop_malformed, bytes);
+			// Validate the TCP header length (data offset) before trusting it.
+			const __u32 doff = (__u32)tcp->doff * 4u;
+			if (doff < 20u || (void *)tcp + doff > data_end)
+				DROP_COUNT(st, drop_malformed, bytes);
 			dport = bpf_ntohs(tcp->dest);
 			is_syn = tcp->syn && !tcp->ack;
 		} else if (proto == IPPROTO_UDP) {
 			struct udphdr *udp = l4;
 			if ((void *)(udp + 1) > data_end)
+				DROP_COUNT(st, drop_malformed, bytes);
+			// UDP length must cover the header and not exceed the L4 span.
+			const __u16 ulen = bpf_ntohs(udp->len);
+			if (ulen < 8u || (__u64)ulen > (__u64)(data_end - l4))
 				DROP_COUNT(st, drop_malformed, bytes);
 			dport = bpf_ntohs(udp->dest);
 		}
@@ -180,10 +194,14 @@ int xdp_fw(struct xdp_md *ctx)
 		if (pc)
 			pclass = *pc;
 
-		if (pclass == FW_PORT_SYSTEM)
+		if (pclass == FW_PORT_SYSTEM) {
+			count_pass(st, bytes);
 			return XDP_PASS;
-		if (pclass == FW_PORT_UNPROTECTED)
+		}
+		if (pclass == FW_PORT_UNPROTECTED) {
+			count_pass(st, bytes);
 			return XDP_PASS;
+		}
 	} else if (proto == IPPROTO_ICMP) {
 		pclass = FW_PORT_GAME;
 	} else {
@@ -191,6 +209,18 @@ int xdp_fw(struct xdp_md *ctx)
 	}
 
 	if (proto == IPPROTO_ICMP) {
+		// Never drop ICMP destination-unreachable/fragmentation-needed (type 3,
+		// code 4): it is required for path MTU discovery.
+		if (ip->frag_off == 0 && ip->protocol == IPPROTO_ICMP) {
+			/* type/code live in the ICMP header after the IPv4 header */
+			if ((void *)ip + ihl + 2 <= data_end) {
+				__u8 *icmp = (void *)ip + ihl;
+				if (icmp[0] == 3 && icmp[1] == 4) {
+					count_pass(st, bytes);
+					return XDP_PASS;
+				}
+			}
+		}
 		if (!(cfg->flags & FW_FLAG_ICMP_ENABLED))
 			DROP_COUNT(st, drop_icmp, bytes);
 	}
@@ -207,9 +237,11 @@ int xdp_fw(struct xdp_md *ctx)
 			count_pass(st, bytes);
 			return XDP_PASS;
 		}
-	}
-
-	if (now - r->window_start_ns >= (__u64)cfg->window_ns) {
+	}	// Guard against a misconfigured zero window: `now - start >= 0` is always
+	// true, which would reset the counters on every packet and silently disable
+	// every per-IP limit. Fall back to a 1s window.
+	const __u64 window_ns = cfg->window_ns ? cfg->window_ns : 1000000000ull;
+	if (now - r->window_start_ns >= window_ns) {
 		r->window_start_ns = now;
 		r->pkt = 0;
 		r->syn = 0;
@@ -259,25 +291,10 @@ int xdp_fw(struct xdp_md *ctx)
 	return XDP_PASS;
 }
 
-// Optional XDP egress accounting program
-SEC("xdp")
-int xdp_fw_egress(struct xdp_md *ctx)
-{
-	void *data = (void *)(long)ctx->data;
-	void *data_end = (void *)(long)ctx->data_end;
-
-	struct fw_stats *st = get_stats();
-	if (!st)
-		return XDP_PASS;
-
-	struct ethhdr *eth = data;
-	if ((void *)(eth + 1) > data_end)
-		return XDP_PASS;
-	if (eth->h_proto != bpf_htons(ETH_P_IP))
-		return XDP_PASS;
-
-	count_pass(st, (__u64)(data_end - data));
-	return XDP_PASS;
-}
+// NOTE: there is no XDP egress hook. A previous `xdp_fw_egress` program lived
+// here but was meaningless (XDP only runs on ingress) and, because bpftool
+// loads the FIRST program in an object file, `--egress` silently re-loaded the
+// ingress program. Outbound filtering, if ever required, belongs in a TC
+// (SEC("tc"/clsact)) program rather than here.
 
 char LICENSE[] SEC("license") = "GPL";

@@ -1,0 +1,35 @@
+Source: femboi-firewall
+Section: net
+Priority: optional
+Maintainer: Flux <flux@users.noreply.github.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ g++,
+ clang,
+ llvm,
+ libbpf-dev,
+ libelf-dev,
+ bpftool,
+ pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/FLUXXFALCON/femboi-firewall
+Rules-Requires-Root: binary-targets
+
+Package: femboi-firewall
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ nftables,
+ iproute2,
+ bpftool | linux-tools-common,
+ libnetfilter-queue1,
+ conntrack
+Recommends: geoip-database
+Suggests: apparmor
+Description: Multi-tier DDoS mitigation engine for Linux game servers
+ XDP/eBPF, nftables and nfqueue L7 inspection tiers for Source/CS2/Rust
+ game servers, with a GeoIP and datacenter ASN filter and a systemd-managed
+ daemon.
+ .
+ Durations, ports and trust lists are configured in /etc/femboi/firewall.conf.

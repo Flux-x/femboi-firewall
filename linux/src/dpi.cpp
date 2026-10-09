@@ -11,11 +11,13 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
 #include <cstring>
+#include <sys/stat.h>
 
 namespace femboifw {
 
@@ -163,7 +165,18 @@ int queue_cb(struct nfq_q_handle* qh, struct nfgenmsg* /*nfmsg*/,
 
 } // namespace
 
-// Run blocking nfqueue packet loop
+// Report whether nfqueue DPI is usable at runtime.
+// This symbol must exist in BOTH build modes: the daemon links it
+// unconditionally, and defining it only in the stub branch caused a link
+// error whenever the build was configured --with-dpi (HAVE_NFQUEUE).
+bool DpiAvailable() {
+    // nfnetlink_queue must be registered in the kernel and the queue sysctl
+    // tree present; without it nfq_create_queue fails at runtime.
+    return access("/proc/net/netfilter/nfnetlink_queue", F_OK) == 0 ||
+           access("/proc/sys/net/netfilter", F_OK) == 0;
+}
+
+// Run nfqueue packet loop with a bounded, interruptible wait.
 void RunDpiLoop(Config& cfg, Counters& counters, std::atomic<uint64_t>& drops,
                 std::atomic<bool>& stop, uint16_t queue_num) {
     struct nfq_handle* h = nfq_open();
@@ -171,11 +184,9 @@ void RunDpiLoop(Config& cfg, Counters& counters, std::atomic<uint64_t>& drops,
         Logf(0, "DPI: nfq_open failed (need root) — DPI disabled");
         return;
     }
-    if (nfq_unbind_pf(h, AF_INET) < 0 || nfq_bind_pf(h, AF_INET) < 0) {
-        Logf(0, "DPI: cannot bind AF_INET handler — DPI disabled");
-        nfq_close(h);
-        return;
-    }
+    // NOTE: nfq_unbind_pf/nfq_bind_pf are legacy and were removed here. They
+    // mutate global AF_INET handler state shared with other nfqueue consumers
+    // (e.g. fail2ban), which could break those users on load.
 
     DpiContext ctx;
     ctx.cfg = &cfg;
@@ -190,13 +201,35 @@ void RunDpiLoop(Config& cfg, Counters& counters, std::atomic<uint64_t>& drops,
     }
     nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff);
     nfq_set_queue_maxlen(qh, 4096);
+#ifdef NFQA_CFG_F_FAIL_OPEN
+    // FAIL_OPEN: if userspace cannot keep up, the kernel accepts packets
+    // instead of dropping them, preventing a self-inflicted DoS when the
+    // queue overflows. The nft `bypass` keyword only covers the "no listener"
+    // case, not a saturated queue.
+    nfq_set_queue_flags(qh, NFQA_CFG_F_FAIL_OPEN, NFQA_CFG_F_FAIL_OPEN);
+#endif
 
     Logf(2, "DPI: listening on nfqueue %u", queue_num);
 
     const int fd = nfq_fd(h);
     std::vector<unsigned char> buf(0xffff + 0x100);
 
+    // Poll with a timeout so SIGTERM/SIGHUP can be observed promptly; a plain
+    // blocking recv() would stall join() indefinitely when the queue is idle.
     while (!stop.load(std::memory_order_relaxed)) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        const int pr = poll(&pfd, 1, 500);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            Logf(1, "DPI: poll failed: %s", strerror(errno));
+            break;
+        }
+        if (pr == 0) continue;  // timeout: re-check the stop flag
+        if (!(pfd.revents & POLLIN)) continue;
+
         const ssize_t n = recv(fd, buf.data(), buf.size(), 0);
         if (n < 0) {
             if (errno == EINTR) continue;

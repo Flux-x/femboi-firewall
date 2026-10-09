@@ -85,7 +85,9 @@ struct Config {
 
     bool datacenter_filter = true;
     bool geo_enabled = true;
-    bool cti_enabled = true;
+
+    // Trusted source addresses/CIDRs exempt from rate limits and auto-ban.
+    std::vector<std::string> whitelist;
     bool auto_ban = true;
     uint32_t ban_seconds = 3600;
     uint32_t per_ip_pps = 400;
@@ -165,6 +167,10 @@ class BanTable {
 public:
     void Add(uint32_t ip_nbo, uint16_t port, const std::string& reason,
              int64_t duration_secs, int count = 1, bool manual = false);
+
+    // Hard upper bound; the oldest expiring entry is evicted when exceeded so
+    // a spoofed-source ban flood cannot grow the table without limit.
+    static constexpr size_t kMaxEntries = 131072;
     bool Remove(uint32_t ip_nbo);
     bool Contains(uint32_t ip_nbo, int64_t now) const;
     void Sweep(int64_t now);
@@ -185,11 +191,16 @@ public:
     static constexpr const char* kFamily = "inet";
 
     bool EnsureBase(const Config& cfg, std::string* err);
+    // Generate the nftables ruleset script (without applying it).
+    std::string BuildScript(const Config& cfg);
     static bool FlushAll();
 
     bool AddBan(uint32_t ip_nbo, uint32_t ttl_secs, std::string* err = nullptr);
     bool DelBan(uint32_t ip_nbo, std::string* err = nullptr);
     bool SyncBanSet(const std::set<uint32_t>& ips, std::string* err = nullptr);
+
+    // Trusted sources (addresses/CIDRs) that bypass limits and auto-ban.
+    bool SyncWhitelist(const std::vector<std::string>& entries, std::string* err = nullptr);
 
     bool SetGeoBlocks(const std::vector<std::pair<uint32_t, uint32_t>>& ranges,
                       std::string* err = nullptr);

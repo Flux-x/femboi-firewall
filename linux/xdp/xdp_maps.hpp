@@ -2,16 +2,19 @@
 // Femboi Firewall XDP map interface
 
 #include <linux/bpf.h>
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -24,7 +27,6 @@ namespace femboifw {
 
 inline constexpr const char* kXdpPinDir = "/sys/fs/bpf/femboifw";
 inline constexpr const char* kXdpProgPin = "/sys/fs/bpf/femboifw/prog";
-inline constexpr const char* kXdpProgPinEgress = "/sys/fs/bpf/femboifw/prog_egress";
 
 namespace bpf_sys {
 
@@ -40,12 +42,52 @@ inline int sys_bpf(enum bpf_cmd cmd, union bpf_attr* attr) {
     return (int)syscall(__NR_bpf, cmd, attr, sizeof(*attr));
 }
 
-// Retrieve pinned BPF object fd
+// Retrieve pinned BPF object fd (close-on-exec so spawned children never
+// inherit and pin the map/program fd).
 inline int obj_get(const char* path) {
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.pathname = (__u64)(unsigned long)path;
-    return sys_bpf(BPF_OBJ_GET, &attr);
+    const int fd = sys_bpf(BPF_OBJ_GET, &attr);
+    if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+
+// Number of possible CPUs. A PERCPU map's value area is sized by *possible*
+// CPUs, not the number of configured/online CPUs. Using get_nprocs_conf()
+// (configured) here under-sized the per-CPU buffer and let the kernel write
+// past it when possible > configured (e.g. `possible=0-255 maxcpus=64`).
+inline int possible_cpus() {
+    std::ifstream possible("/sys/devices/system/cpu/possible");
+    if (possible) {
+        std::string spec;
+        if (std::getline(possible, spec)) {
+            int max_id = -1;
+            size_t i = 0;
+            while (i < spec.size()) {
+                while (i < spec.size() && !isdigit((unsigned char)spec[i])) i++;
+                if (i >= spec.size()) break;
+                int lo = 0;
+                while (i < spec.size() && isdigit((unsigned char)spec[i])) {
+                    lo = lo * 10 + (spec[i] - '0');
+                    i++;
+                }
+                int hi = lo;
+                if (i < spec.size() && spec[i] == '-') {
+                    i++;
+                    hi = 0;
+                    while (i < spec.size() && isdigit((unsigned char)spec[i])) {
+                        hi = hi * 10 + (spec[i] - '0');
+                        i++;
+                    }
+                }
+                if (hi > max_id) max_id = hi;
+            }
+            if (max_id >= 0) return max_id + 1;
+        }
+    }
+    const long online = sysconf(_SC_NPROCESSORS_CONF);
+    return online > 0 ? (int)online : 1;
 }
 
 // Update entry in BPF map
@@ -292,7 +334,7 @@ struct XdpMaps {
     bool ReadStats(struct fw_stats* out) const {
         if (stats < 0) return false;
 
-        const int ncpu = get_nprocs_conf();
+        const int ncpu = possible_cpus();
         if (ncpu <= 0 || ncpu > 4096) return false;
 
         std::vector<struct fw_stats> per(ncpu);

@@ -5,12 +5,14 @@
 #include <arpa/inet.h>
 #include <climits>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <utility>
@@ -129,7 +131,6 @@ void ParseKeyValue(Config& cfg, const std::string& key, const std::string& val) 
     if (key == "enabled") cfg.enabled = (val == "1" || val == "true" || val == "yes");
     else if (key == "datacenter_filter") cfg.datacenter_filter = (val != "0" && val != "false");
     else if (key == "geo_enabled") cfg.geo_enabled = (val != "0" && val != "false");
-    else if (key == "cti_enabled") cfg.cti_enabled = (val != "0" && val != "false");
     else if (key == "auto_ban") cfg.auto_ban = (val != "0" && val != "false");
     else if (key == "ban_seconds") cfg.ban_seconds = (uint32_t)strtoul(val.c_str(), nullptr, 10);
     else if (key == "per_ip_pps") cfg.per_ip_pps = (uint32_t)strtoul(val.c_str(), nullptr, 10);
@@ -141,6 +142,17 @@ void ParseKeyValue(Config& cfg, const std::string& key, const std::string& val) 
     else if (key == "geoip_path") cfg.geoip_path = val;
     else if (key == "rules_path") cfg.rules_path = val;
     else if (key == "state_dir") cfg.state_dir = val;
+    else if (key == "whitelist") {
+        cfg.whitelist.clear();
+        std::stringstream ws(val);
+        std::string item;
+        while (std::getline(ws, item, ',')) {
+            item = trim(item);
+            if (!item.empty()) cfg.whitelist.push_back(item);
+        }
+    } else {
+        Logf(1, "config: unknown key '%s' ignored", key.c_str());
+    }
 }
 
 } // namespace
@@ -173,7 +185,7 @@ bool Config::Load(const std::string& path, std::string* err) {
 
     std::string line;
     int slot = 0;
-    bool saw_ports = false;
+    bool slots_init = false;
 
     while (std::getline(in, line)) {
         std::string t = trim(line);
@@ -185,8 +197,9 @@ bool Config::Load(const std::string& path, std::string* err) {
         const std::string val = trim(t.substr(eq + 1));
 
         if (key == "ports") {
-            saw_ports = true;
+            // Reset the slot table once, then keep any later slot entries.
             ParsePorts(ports, val);
+            slots_init = true;
             continue;
         }
 
@@ -196,14 +209,19 @@ bool Config::Load(const std::string& path, std::string* err) {
                      rate = 100, speed = 10000, proto = 0;
             ss >> port >> enabled >> type >> attack >> rate >> speed >> proto;
             if (port == 0 || port > 65535) continue;
-            if (!saw_ports) ports.assign(kMaxPorts, PortSlot{});
+            // Initialise the table exactly once; a stray `slotN=` line must
+            // not wipe previously parsed slots.
+            if (!slots_init) {
+                ports.assign(kMaxPorts, PortSlot{});
+                slots_init = true;
+            }
             PortSlot s;
             s.port = (uint16_t)port;
             s.enabled = enabled != 0;
             s.type = (type <= 2) ? (int)type : port_auto_classify(s.port);
             s.attack = attack != 0;
             s.rate_limit = (rate >= 10 && rate <= 500) ? rate : 100;
-            s.speed_mbps = speed;
+            s.speed_mbps = (speed <= 100000) ? speed : 10000;
             s.proto = (proto <= 2) ? (int)proto : kProtoBoth;
             if (slot < kMaxPorts) ports[slot++] = s;
             continue;
@@ -229,14 +247,17 @@ bool Config::Save(const std::string& path, std::string* err) const {
         return false;
     }
 
-    char resolved[PATH_MAX];
-    if (realpath(path.c_str(), resolved) == nullptr) {
-        if (err) *err = "cannot resolve config destination: " + path;
-        return false;
-    }
+    // Resolve the *parent* directory rather than the file: the destination may
+    // not exist yet on first run, and realpath() on a missing file fails.
+    std::error_code ec;
+    const std::filesystem::path p(path);
+    std::filesystem::path parent = p.parent_path();
+    if (parent.empty()) parent = ".";
+    std::filesystem::path canon = std::filesystem::weakly_canonical(parent, ec);
+    if (ec) canon = parent;
+    const std::string dest = (canon / p.filename()).string();
+    const std::string tmp = dest + ".tmp";
 
-    const std::string safe_dest = resolved;
-    const std::string tmp = safe_dest + ".tmp";
     {
         std::ofstream out(tmp, std::ios::trunc);
         if (!out) {
@@ -244,10 +265,12 @@ bool Config::Save(const std::string& path, std::string* err) const {
             return false;
         }
         out << "# Femboi Firewall configuration\n"
-            << "# Ports format: port/proto comma separated\n"
-            << "# System ports are exempted\n\n";
+            << "# Managed by `femboi-firewall set`; hand-editing is supported.\n"
+            << "# `ports=` is the compact form; `slotN=` preserves full per-port\n"
+            << "# attributes (type/attack/rate/speed/proto).\n\n";
 
         out << "enabled=" << (enabled ? 1 : 0) << "\n";
+
         out << "ports=";
         bool first = true;
         for (const auto& s : ports) {
@@ -256,12 +279,32 @@ bool Config::Save(const std::string& path, std::string* err) const {
             out << s.port << "/" << port_proto_name(s.proto);
             first = false;
         }
-        out << "\n\n";
+        out << "\n";
+
+        // Full-fidelity slot table. Loaded after `ports=` and overrides it.
+        int idx = 0;
+        for (const auto& s : ports) {
+            if (s.port == 0) continue;
+            out << "slot" << idx++ << "=" << s.port << " " << (s.enabled ? 1 : 0)
+                << " " << s.type << " " << (s.attack ? 1 : 0) << " " << s.rate_limit
+                << " " << s.speed_mbps << " " << s.proto << "\n";
+        }
+        out << "\n";
+
+        if (!whitelist.empty()) {
+            out << "whitelist=";
+            bool wfirst = true;
+            for (const auto& w : whitelist) {
+                if (!wfirst) out << ",";
+                out << w;
+                wfirst = false;
+            }
+            out << "\n";
+        }
 
         out << "# Filtering\n";
         out << "datacenter_filter=" << (datacenter_filter ? 1 : 0) << "\n";
         out << "geo_enabled=" << (geo_enabled ? 1 : 0) << "\n";
-        out << "cti_enabled=" << (cti_enabled ? 1 : 0) << "\n";
         out << "auto_ban=" << (auto_ban ? 1 : 0) << "\n";
         out << "ban_seconds=" << ban_seconds << "\n";
         out << "per_ip_pps=" << per_ip_pps << "\n";
@@ -279,10 +322,24 @@ bool Config::Save(const std::string& path, std::string* err) const {
         out << "geoip_path=" << geoip_path << "\n";
         out << "rules_path=" << rules_path << "\n";
         out << "state_dir=" << state_dir << "\n";
+        out.flush();
+        if (!out) {
+            if (err) *err = "write failed: " + tmp;
+            return false;
+        }
     }
 
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        if (err) *err = "cannot replace " + path;
+    // Durably flush the temp file before the atomic rename.
+    const int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+    }
+    if (::chmod(tmp.c_str(), 0600) != 0) {
+        // Non-fatal: best effort to tighten permissions.
+    }
+    if (std::rename(tmp.c_str(), dest.c_str()) != 0) {
+        if (err) *err = "cannot replace " + dest;
         return false;
     }
     return true;
@@ -508,14 +565,30 @@ void BanTable::Add(uint32_t ip_nbo, uint16_t port, const std::string& reason,
     auto it = bans_.find(ip_nbo);
     if (it != bans_.end()) {
         it->second.count += count;
+        // Always record a manual escalation, even for an existing permanent
+        // record, so `unban`/policy decisions see the operator intent.
+        if (manual) it->second.manual = true;
         if (it->second.expires_at == 0) return;
         if (expires == 0) {
             it->second.expires_at = 0;
         } else if (expires > it->second.expires_at) {
             it->second.expires_at = expires;
         }
-        if (manual) it->second.manual = true;
         return;
+    }
+
+    // Bound memory: a spoofed auto-ban flood must not grow the table without
+    // limit. Evict the entry that expires soonest (permanent entries last).
+    if (bans_.size() >= kMaxEntries) {
+        auto victim = bans_.end();
+        for (auto v = bans_.begin(); v != bans_.end(); ++v) {
+            if (victim == bans_.end()) { victim = v; continue; }
+            const int64_t ve = victim->second.expires_at;
+            const int64_t ce = v->second.expires_at;
+            if (ve == 0) { victim = v; continue; }
+            if (ce != 0 && ce < ve) victim = v;
+        }
+        if (victim != bans_.end()) bans_.erase(victim);
     }
 
     BanEntry e;
@@ -559,16 +632,17 @@ void BanTable::Sweep(int64_t now) {
 std::vector<BanEntry> BanTable::Snapshot(int64_t now, size_t limit) const {
     std::lock_guard<std::mutex> lk(mu_);
     std::vector<BanEntry> out;
-    out.reserve(std::min(limit, bans_.size()));
     for (const auto& kv : bans_) {
         if (kv.second.expires_at == 0 || kv.second.expires_at > now) {
             out.push_back(kv.second);
-            if (out.size() >= limit) break;
         }
     }
+    // Sort the full active set first, then truncate: limiting before sorting
+    // would return an arbitrary subset rather than the soonest-expiring bans.
     std::sort(out.begin(), out.end(), [](const BanEntry& a, const BanEntry& b) {
         return a.expires_at < b.expires_at;
     });
+    if (out.size() > limit) out.resize(limit);
     return out;
 }
 

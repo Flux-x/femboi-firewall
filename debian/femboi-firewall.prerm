@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            deb-systemd-invoke stop femboi-firewall.service >/dev/null 2>&1 || true
+        fi
+        # The daemon retains its ruleset on clean exit by design (continuity
+        # across restarts). On package removal we must remove it explicitly so
+        # uninstalling does not leave a firewall behind.
+        if command -v nft >/dev/null 2>&1; then
+            nft delete table inet femboifw 2>/dev/null || true
+        fi
+        if command -v femboi-firewall-xdp >/dev/null 2>&1; then
+            femboi-firewall-xdp detach 2>/dev/null || true
+        fi
+        ;;
+    upgrade|failed-upgrade)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

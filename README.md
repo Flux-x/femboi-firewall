@@ -161,25 +161,41 @@ sudo systemctl status femboi-firewall
 
 Config file location: `/etc/femboi/firewall.conf`
 
+**Flat `key=value` format — INI `[sections]` are not supported.** Unknown keys
+are logged and ignored. The canonical example lives in
+[`firewall.conf.example`](firewall.conf.example).
+
 ```ini
-[firewall]
 enabled=1
-interface=eth0
+
+# port/proto (proto: tcp | udp | both)
+ports=27016/udp,27015/udp,80/tcp,443/tcp
+
+# Trusted sources: exempt from rate limits and auto-ban
+whitelist=203.0.113.7,10.0.0.0/8
+
+datacenter_filter=1
+geo_enabled=1
+auto_ban=1
+ban_seconds=3600
+
 per_ip_pps=1000
-burst_pps=2000
-ban_duration_secs=3600
+rate_burst=2000
 
-enable_xdp=1
-enable_dpi=1
-enable_geoip=1
-enable_datacenter_filter=1
-enable_autoban=1
+dpi_enabled=0
+dpi_queue=200
 
-[ports]
-27015 = udp:game:100:100
-27016 = udp:game:100:100
-443   = tcp:web:50:25
-80    = tcp:web:50:25
+xdp_enabled=1
+xdp_pin_dir=/sys/fs/bpf/femboifw
+
+geoip_path=/usr/share/femboi/geoip.dat
+rules_path=/etc/femboi/geo_rules.json
+state_dir=/var/lib/femboi
+```
+
+Validate the generated ruleset before applying it:
+```bash
+sudo femboi-firewall ruleset | nft -c -f -
 ```
 
 Reload ruleset without dropping traffic:

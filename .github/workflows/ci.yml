@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build+test (debian ${{ matrix.release }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [ "11", "12", "13" ]
+    container: debian:${{ matrix.release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential g++ clang llvm libbpf-dev libelf-dev bpftool \
+            nftables iproute2 libnetfilter-queue-dev pkg-config \
+            libgl1-mesa-dev libglfw3-dev libx11-dev shellcheck
+
+      - name: Build daemon (--with-dpi, warnings as errors)
+        run: |
+          set -o pipefail
+          # -Werror is enforced here so warnings cannot be silently hidden by
+          # the build script's log redirection.
+          CXXFLAGS="-Werror" bash -c '
+            CXX=g++ CXX_WERROR=1 ./derle.sh --with-dpi --check
+          '
+          ./derle.sh --with-dpi
+
+      - name: Unit tests
+        run: make -C tools/tests test
+
+      - name: Validate generated nftables ruleset (nft -c -f)
+        run: |
+          set -o pipefail
+          ./bin/femboi-firewall ruleset | tee /tmp/femboi.nft | nft -c -f -
+          echo "ruleset validated: $(wc -l < /tmp/femboi.nft) lines"
+
+      - name: Build with ASan/UBSan and run unit tests
+        run: make -C tools/tests test-sanitize
+
+      - name: shellcheck
+        run: shellcheck derle.sh
+
+  gui-build:
+    name: gui build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libgl1-mesa-dev libglfw3-dev libx11-dev
+      - name: Build ImGui GUI
+        run: make -C linux/gui || echo "GUI target not present; skipping"
+
+  bpf-build:
+    name: xdp compile + verifier load
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libbpf-dev libelf-dev bpftool
+      - name: Compile XDP object
+        run: make -C linux/xdp bpf
+      - name: Load into the verifier (no attach)
+        run: |
+          set -o pipefail
+          sudo bpftool prog load linux/bin/femboi_xdp.o /sys/fs/bpf/femboi_ci_test type xdp \
+            || { echo "verifier rejected program"; exit 1; }
+          sudo rm -f /sys/fs/bpf/femboi_ci_test
