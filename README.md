@@ -1,65 +1,49 @@
-<p align="center">
-  <h1 align="center">femboi-firewall</h1>
-  <p align="center">
-    <strong>Multi-tier DDoS mitigation engine & Dear ImGui control panel for Linux</strong>
-  </p>
-  <p align="center">
-    <a href="https://github.com/FLUXXFALCON/femboi-firewall/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-22272e.svg?style=flat-square" alt="License"></a>
-    <img src="https://img.shields.io/badge/kernel-5.x%20%7C%206.x-22272e.svg?style=flat-square" alt="Kernel">
-    <img src="https://img.shields.io/badge/datapath-eBPF%20%2F%20XDP-22272e.svg?style=flat-square" alt="XDP">
-    <img src="https://img.shields.io/badge/filter-nftables-22272e.svg?style=flat-square" alt="nftables">
-    <img src="https://img.shields.io/badge/gui-Dear%20ImGui-22272e.svg?style=flat-square" alt="ImGui">
-    <img src="https://img.shields.io/badge/c%2B%2B-20-22272e.svg?style=flat-square" alt="C++20">
-  </p>
-</p>
+# femboi-firewall
+
+Linux firewall for game servers (Source Engine, CS2, Rust) combining eBPF/XDP packet filtering, nftables rulesets, and an optional ImGui panel.
+
+## Filtering Layers
+
+- **XDP (eBPF)**: Early packet drops at the driver level before reaching the network stack.
+- **nftables**: Rate limiting, dynamic IP bans, GeoIP filtering, and port rules.
+- **L7 DPI (nfqueue)**: Inspection for game query floods (A2S_INFO) and malformed payloads.
+- **ImGui GUI**: Optional desktop panel to monitor traffic and manage rules.
 
 ---
 
-### // Overview
-
-**femboi-firewall** is an open-source, multi-layer packet filtering engine built for high-throughput Linux game servers (Source Engine, CS2, Rust) and web services.
-
-Traffic processing is split across three execution tiers:
-- **L3/L4 Wire Speed (XDP)**: Early kernel packet rejection before socket buffer (`sk_buff`) allocation.
-- **Stateful Policy (nftables)**: Dynamic ban sets, GeoIP routing, datacenter ASN filters, and per-port token buckets.
-- **Application L7 (nfqueue DPI)**: Deep packet inspection for Steam A2S query floods, malformed packets, and HTTP scanners.
-- **Operator GUI (Dear ImGui)**: Lightweight desktop administration panel over OpenGL3/GLFW.
-
----
-
-### // Interface
+## Interface
 
 <div align="center">
 
-#### ▸ Telemetry & Live Traffic
-<sub>Real-time ingress, mitigation rates, and attack logs.</sub>
+### Telemetry & Live Traffic
+<sub>Real-time ingress bandwidth, mitigation rates, drop stats, and live attack logs.</sub>
 <br><br>
 <img src="assets/overview.png" alt="Overview Tab" width="880" />
 
 <br><br>
 
-#### ▸ Port Quotas & Protocol Rules
-<sub>Per-port bandwidth caps, protocol separation (UDP/TCP), and rate limit budgets.</sub>
+### Port Quotas & Protocol Rules
+<sub>Per-port bandwidth caps, UDP/TCP protocol separation, and rate limit budgets.</sub>
 <br><br>
 <img src="assets/ports.png" alt="Ports Tab" width="880" />
 
 <br><br>
 
-#### ▸ Active Ban Sets
+### Active Ban Sets
 <sub>Dynamic blacklist decay timers and instant manual unbans.</sub>
 <br><br>
 <img src="assets/bans.png" alt="Bans Tab" width="880" />
 
 <br><br>
 
-#### ▸ GeoIP Access Policies
+### GeoIP Access Policies
 <sub>In-memory binary trie country filtering (`geoip.dat`).</sub>
 <br><br>
 <img src="assets/geo.png" alt="Geo Tab" width="880" />
 
 <br><br>
 
-#### ▸ Engine Settings & Modules
+### Engine Settings & Modules
 <sub>Runtime toggles for XDP datapath, L7 DPI, ASN filters, and burst thresholds.</sub>
 <br><br>
 <img src="assets/settings.png" alt="Settings Tab" width="880" />
@@ -68,58 +52,44 @@ Traffic processing is split across three execution tiers:
 
 ---
 
-### // Architecture
+## Architecture Overview
 
 ```
-                       ┌──────────────────────────────────────────────┐
-  NIC Ingress ──────►  │ Tier 1: XDP / eBPF Driver Program            │  Wire Speed
-                       │ • Driver-level drop before skb allocation    │  L3 / L4
-                       │ • SYN / UDP / ICMP flood mitigation          │  Zero Alloc
-                       │ • Per-IP token-bucket rate limiter           │
-                       └──────────────────────┬───────────────────────┘
-                                              │ XDP_PASS
-                       ┌──────────────────────▼───────────────────────┐
-                       │ Tier 2: nftables (`inet femboifw`)           │  Kernel Policy
-                       │ • Dynamic ban sets and CIDR blacklists       │  Stateful L4
-                       │ • GeoIP country lookup                       │
-                       │ • Per-port bandwidth / PPS quotas            │
-                       └──────────────────────┬───────────────────────┘
-                                              │ accept
-                       ┌──────────────────────▼───────────────────────┐
-                       │ Tier 3: nfqueue L7 DPI                       │  Userspace
-                       │ • Source Engine (A2S) query validation       │  Application L7
-                       │ • Malformed payload & exploit filtering      │
-                       │ • HTTP scanner signatures                    │
-                       └──────────────────────┬───────────────────────┘
-                                              │ Clean Stream
-                       ┌──────────────────────▼───────────────────────┐
-                       │ Protected Server (srcds, cs2, nginx)         │
-                       └──────────────────────────────────────────────┘
+ NIC Ingress  ───►  [ Tier 1: XDP / eBPF Driver ]    L3/L4 Wire-Speed Drops
+                          │ (XDP_PASS)
+                          ▼
+                    [ Tier 2: nftables Ruleset ]     Kernel Policy & GeoIP
+                          │ (accept)
+                          ▼
+                    [ Tier 3: nfqueue L7 DPI ]       Game Protocol Verification
+                          │ (clean stream)
+                          ▼
+                    [ Protected Application ]        srcds, cs2, nginx
 ```
 
-| Tier | Subsystem | Hook Location | Latency | Responsibility |
-|:---|:---|:---|:---|:---|
-| **Tier 1** | **XDP (eBPF)** | Driver RX ring | `< 1 µs` | Volumetric flood drops prior to Linux network stack allocation. |
-| **Tier 2** | **nftables** | Netfilter prerouting | Low | Stateful rate limits, port budgets, ASN & country sets. |
-| **Tier 3** | **nfqueue DPI** | Userspace queue | Targeted | Game protocol verification (A2S challenge enforcement) and exploit drops. |
+| Ingress Layer | Subsystem | Latency | Main Responsibility |
+|:---|:---|:---|:---|
+| **Tier 1** | **XDP (eBPF)** | `< 1 µs` | High-volume flood drops before Linux network stack allocation. |
+| **Tier 2** | **nftables** | Low | Stateful rate limits, per-port bandwidth budgets, ASN and country sets. |
+| **Tier 3** | **nfqueue DPI** | Targeted | Steam A2S query validation, challenge enforcement, and exploit payload drops. |
 
 ---
 
-### // Features
+## Features
 
-- **XDP Driver Offload**: Drops malicious packets at driver level at wire speed.
-- **Source Protocol Guard**: Validates A2S_INFO and challenge responses; mitigates reflection amplification.
-- **Embedded GeoIP**: In-memory binary search over 200k+ IP CIDRs (`geoip.dat`) with microsecond resolution.
-- **Datacenter / ASN Filter**: Drops automated traffic from hosting and cloud IP blocks.
-- **Hardware-Accelerated Panel**: Dear ImGui + GLFW desktop interface running at 60 FPS on X11 sessions.
-- **Zero External Runtimes**: Pure C++20 / C. No Python, Node.js, or Java runtime dependencies on server.
+- **XDP Driver Offload**: Drops malicious packets at driver level to prevent CPU exhaustion.
+- **Source Engine Protocol Guard**: Validates `A2S_INFO` and challenge responses to mitigate reflection amplification.
+- **Embedded GeoIP**: In-memory binary search over 200,000+ IP CIDRs (`geoip.dat`).
+- **Datacenter / ASN Filter**: Rejects automated traffic originating from hosting and cloud IP ranges.
+- **ImGui Desktop Control Panel**: Hardware-accelerated desktop interface for real-time monitoring and rule editing.
+- **Zero Runtime Overhead**: Written in pure C++20 / C. No Python, Node.js, or Java runtime requirements.
 - **Live Rule Reload**: Modify limits and unban addresses on-the-fly without dropping active connections.
 
 ---
 
-### // Quick Start
+## Installation & Quickstart
 
-#### 1. Dependencies (Debian / Ubuntu)
+### 1. Install Dependencies (Debian / Ubuntu)
 
 ```bash
 sudo apt update
@@ -127,7 +97,7 @@ sudo apt install -y build-essential nftables clang llvm libbpf-dev bpftool \
                     libgl1-mesa-dev libglfw3-dev libx11-dev linux-headers-$(uname -r)
 ```
 
-#### 2. Build & Install Daemon
+### 2. Build & Install Daemon
 
 ```bash
 git clone https://github.com/FLUXXFALCON/femboi-firewall.git
@@ -138,14 +108,14 @@ chmod +x derle.sh
 sudo ./derle.sh --install
 ```
 
-#### 3. Build Operator GUI (Optional)
+### 3. Build Operator GUI (Optional)
 
 ```bash
 make -C linux/gui
 sudo cp linux/gui/fw-gui /usr/local/bin/fluxxfw-gui
 ```
 
-#### 4. Service Control
+### 4. Service Control
 
 ```bash
 # Start and enable daemon
@@ -157,9 +127,9 @@ sudo systemctl status femboi-firewall
 
 ---
 
-### // Configuration
+## Configuration Example
 
-Config file location: `/etc/femboi/firewall.conf`
+Configuration file: `/etc/femboi/firewall.conf`
 
 **Flat `key=value` format — INI `[sections]` are not supported.** Unknown keys
 are logged and ignored. The canonical example lives in
@@ -198,29 +168,29 @@ Validate the generated ruleset before applying it:
 sudo femboi-firewall ruleset | nft -c -f -
 ```
 
-Reload ruleset without dropping traffic:
+Reload ruleset without dropping active traffic:
 ```bash
 sudo systemctl reload femboi-firewall
 ```
 
 ---
 
-### // CLI Commands
+## CLI Management
 
 ```bash
-# Daemon status and counters
+# View daemon status and packet counters
 femboi-firewall --status
 
-# XDP eBPF map inspection
+# Inspect XDP eBPF map statistics
 femboi-firewall-xdp stats
 
-# View nftables ruleset
+# View active nftables ruleset
 sudo nft list table inet femboifw
 ```
 
 ---
 
-### // Windows Cross-Build
+## Windows Cross-Compilation
 
 To cross-compile static Linux binaries from Windows:
 
@@ -228,10 +198,11 @@ To cross-compile static Linux binaries from Windows:
 :: Requires zig in PATH
 derle.bat
 ```
+
 Output binaries are written to `bin/` (`femboi-firewall`, `femboi-firewall-xdp`).
 
 ---
 
-### // License
+## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+Distributed under the [MIT License](LICENSE).
