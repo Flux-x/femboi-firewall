@@ -347,6 +347,42 @@ name variance remain deployment concerns (item 39/32).
 
 ---
 
+## Update 2 — deferred items now implemented
+
+A second pass implemented the highest-value deferred items. **Same caveat: no
+compiler/kernel here, so all of this is static-review only and must be verified
+by CI/live testing.**
+
+- **Item 15 / DPI reload race — DONE.** `EngineState::cfg` is now
+  `std::shared_ptr<const Config>`. Reload builds a new snapshot off to the side
+  and publishes it only after it parses. The DPI worker takes its own
+  `shared_ptr<const Config>`; on reload the old worker is joined (releasing its
+  reference) and a fresh one is started, so `dpi_enabled`/`dpi_queue` toggles
+  take effect and the reader can never race a freed config. `RunDpiLoop`
+  signature changed accordingly.
+- **Item 3 — durable ban store, single source of truth.** `BanTable` gained
+  `SetStorePath`/`Persist`/`Restore` (atomic temp+rename, tab-separated). The
+  daemon restores `state_dir/bans.db` on start, persists on every mutation and
+  sweep, and the CLI `ban`/`unban` write through the same store so userspace is
+  authoritative across processes. A unit test covers the round-trip.
+- **Item 2 — userspace handshake-gated auto-ban.** New opt-in module
+  `linux/src/conntrack.cpp` (`--with-conntrack`, `HAVE_CONNTRACK`) subscribes to
+  kernel conntrack events and escalates a source only once conntrack reaches
+  `ESTABLISHED`. A spoofed SYN can no longer blackhole a victim; a real abuser
+  opening many handshakes still gets banned. Falls back to a stub otherwise.
+- **Item 9 / 10 — XDP map redesign.** `blacklist` is now a non-LRU `HASH`
+  (spoof floods can no longer evict real bans); `rates` is now a single shared
+  `LRU_HASH` (a true per-source total, not multiplied by CPU count); the
+  datapath walks up to two 802.1Q/802.1ad tags; non-TCP/UDP protocols and
+  non-first fragments are treated as protected instead of bypassing limits; and
+  per-port PPS budgets are enforced in XDP via new `port_limits`/`port_rates`
+  maps populated from config (`SetPortLimit`).
+
+**Unverified / residual risk:** the conntrack module (libnetfilter-conntrack API
+usage, event loop) and the redesigned XDP datapath (verifier acceptance, new
+maps) are the least-verified changes here. The `.deb`/CI now build with
+`--with-conntrack`; the XDP verifier-load CI job is the gate for the map changes.
+
 ## Follow-ups (recommended order)
 1. Userspace auto-ban on `ct state established` + durable ban store in
    `state_dir` (items 2, 3, 15).

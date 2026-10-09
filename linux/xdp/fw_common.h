@@ -11,6 +11,14 @@
 #define ETH_P_IP 0x0800
 #endif
 
+// 802.1Q / 802.1ad tags (VLAN walking in the datapath).
+#ifndef ETH_P_8021Q
+#define ETH_P_8021Q 0x8100
+#endif
+#ifndef ETH_P_8021AD
+#define ETH_P_8021AD 0x88A8
+#endif
+
 #define FW_MAX_BLACKLIST (1u << 20)
 #define FW_MAX_WHITELIST (1u << 16)
 #define FW_MAX_RATES (1u << 20)

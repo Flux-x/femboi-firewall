@@ -6,15 +6,17 @@
 
 #include "fw_common.h"
 
-// Banned host address map
+// Banned host address map.
+// NOT LRU: an LRU blacklist lets a spoofed-source flood evict the real bans.
+// HASH is the correct container for authoritative enforcement state.
 struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, __u32);
 	__type(value, struct fw_ban_value);
 	__uint(max_entries, FW_MAX_BLACKLIST);
 } blacklist SEC(".maps");
 
-// Whitelisted host address map
+// Whitelisted host address map.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, __u32);
@@ -22,13 +24,34 @@ struct {
 	__uint(max_entries, FW_MAX_WHITELIST);
 } whitelist SEC(".maps");
 
-// Per-CPU rate limit counters
+// Per-IP rate accounting.
+// Deliberately NOT per-CPU: a PERCPU map multiplies the effective limit by the
+// CPU count and makes the limit unenforceable. A single shared value gives a
+// true per-source total. LRU is acceptable here because rate state is
+// disposable (losing an entry only resets a window).
 struct {
-	__uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__type(key, __u32);
 	__type(value, struct fw_rate);
 	__uint(max_entries, FW_MAX_RATES);
 } rates SEC(".maps");
+
+// Per-port PPS limits, keyed by destination port (only configured ports are
+// present; a missing key means "no per-port limit").
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 4096);
+} port_limits SEC(".maps");
+
+// Per-(source, destination port) accounting for the per-port limits.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, __u64);
+	__type(value, struct fw_rate);
+	__uint(max_entries, FW_MAX_RATES);
+} port_rates SEC(".maps");
 
 // Runtime filter configuration map
 struct {
@@ -103,6 +126,40 @@ static __always_inline void ban_source(__u32 saddr, __u32 reason, __u64 ttl_ns,
 		st->auto_bans++;
 }
 
+// Resolve the IPv4 header, skipping up to two 802.1Q/802.1ad VLAN tags.
+// Returns NULL if the frame is malformed or not a bare IPv4 frame.
+static __always_inline struct iphdr *l3_ipv4(void *data, void *data_end)
+{
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return NULL;
+
+	__u16 h_proto = eth->h_proto;
+	void *nh = (void *)(eth + 1);
+
+#pragma unroll
+	for (int i = 0; i < 2; i++) {
+		if (h_proto == bpf_htons(ETH_P_8021Q) ||
+		    h_proto == bpf_htons(ETH_P_8021AD)) {
+			struct vlan_hdr *vh = nh;
+			if ((void *)(vh + 1) > data_end)
+				return NULL;
+			h_proto = vh->h_vlan_encapsulated_proto;
+			nh = (void *)(vh + 1);
+		} else {
+			break;
+		}
+	}
+
+	if (h_proto != bpf_htons(ETH_P_IP))
+		return NULL;
+
+	struct iphdr *ip = nh;
+	if ((void *)(ip + 1) > data_end)
+		return NULL;
+	return ip;
+}
+
 // Main XDP ingress filter program
 SEC("xdp")
 int xdp_fw(struct xdp_md *ctx)
@@ -112,15 +169,8 @@ int xdp_fw(struct xdp_md *ctx)
 
 	struct fw_stats *st = get_stats();
 
-	struct ethhdr *eth = data;
-	if ((void *)(eth + 1) > data_end)
-		return XDP_PASS;
-
-	if (eth->h_proto != bpf_htons(ETH_P_IP))
-		return XDP_PASS;
-
-	struct iphdr *ip = (void *)(eth + 1);
-	if ((void *)(ip + 1) > data_end)
+	struct iphdr *ip = l3_ipv4(data, data_end);
+	if (!ip)
 		return XDP_PASS;
 
 	const __u32 saddr = ip->saddr;
@@ -188,7 +238,18 @@ int xdp_fw(struct xdp_md *ctx)
 	}
 
 	__u8 pclass = FW_PORT_UNPROTECTED;
-	if (!is_fragment && proto != IPPROTO_ICMP) {
+	if (proto == IPPROTO_ICMP) {
+		pclass = FW_PORT_GAME;
+	} else if (is_fragment) {
+		// Non-first fragments carry no L4 header; treat as protected so they
+		// cannot bypass the per-source budget.
+		pclass = FW_PORT_GAME;
+	} else if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) {
+		// Protocols other than TCP/UDP (GRE, ESP, SCTP, ...) have no port to
+		// classify. Previously they fell through via port_class[0] and were
+		// never limited; treat them as protected instead.
+		pclass = FW_PORT_GAME;
+	} else {
 		__u32 key = dport;
 		__u8 *pc = bpf_map_lookup_elem(&port_class, &key);
 		if (pc)
@@ -202,23 +263,16 @@ int xdp_fw(struct xdp_md *ctx)
 			count_pass(st, bytes);
 			return XDP_PASS;
 		}
-	} else if (proto == IPPROTO_ICMP) {
-		pclass = FW_PORT_GAME;
-	} else {
-		pclass = FW_PORT_GAME;
 	}
 
 	if (proto == IPPROTO_ICMP) {
 		// Never drop ICMP destination-unreachable/fragmentation-needed (type 3,
 		// code 4): it is required for path MTU discovery.
-		if (ip->frag_off == 0 && ip->protocol == IPPROTO_ICMP) {
-			/* type/code live in the ICMP header after the IPv4 header */
-			if ((void *)ip + ihl + 2 <= data_end) {
-				__u8 *icmp = (void *)ip + ihl;
-				if (icmp[0] == 3 && icmp[1] == 4) {
-					count_pass(st, bytes);
-					return XDP_PASS;
-				}
+		if ((void *)ip + ihl + 2 <= data_end) {
+			__u8 *icmp = (void *)ip + ihl;
+			if (icmp[0] == 3 && icmp[1] == 4) {
+				count_pass(st, bytes);
+				return XDP_PASS;
 			}
 		}
 		if (!(cfg->flags & FW_FLAG_ICMP_ENABLED))
@@ -237,7 +291,9 @@ int xdp_fw(struct xdp_md *ctx)
 			count_pass(st, bytes);
 			return XDP_PASS;
 		}
-	}	// Guard against a misconfigured zero window: `now - start >= 0` is always
+	}
+
+	// Guard against a misconfigured zero window: `now - start >= 0` is always
 	// true, which would reset the counters on every packet and silently disable
 	// every per-IP limit. Fall back to a 1s window.
 	const __u64 window_ns = cfg->window_ns ? cfg->window_ns : 1000000000ull;
@@ -260,6 +316,37 @@ int xdp_fw(struct xdp_md *ctx)
 
 	const bool may_ban = (cfg->flags & FW_FLAG_AUTO_BAN) != 0;
 	const __u64 ttl = cfg->ban_time_ns;
+
+	// Per-port budget (in addition to the per-source budget below).
+	if (pclass == FW_PORT_GAME || pclass == FW_PORT_WEB) {
+		__u32 pkey = dport;
+		__u32 *plim = bpf_map_lookup_elem(&port_limits, &pkey);
+		if (plim && *plim) {
+			const __u64 ckey = ((__u64)saddr << 16) | dport;
+			struct fw_rate *pr = bpf_map_lookup_elem(&port_rates, &ckey);
+			if (!pr) {
+				struct fw_rate fresh = {
+					.window_start_ns = now,
+					.last_seen_ns = now,
+				};
+				bpf_map_update_elem(&port_rates, &ckey, &fresh, BPF_NOEXIST);
+				pr = bpf_map_lookup_elem(&port_rates, &ckey);
+			}
+			if (pr) {
+				if (now - pr->window_start_ns >= window_ns) {
+					pr->window_start_ns = now;
+					pr->pkt = 0;
+				}
+				pr->last_seen_ns = now;
+				pr->pkt++;
+				if (pr->pkt > *plim) {
+					if (may_ban)
+						ban_source(saddr, FW_BAN_PPS, ttl, st);
+					DROP_COUNT(st, drop_pps, bytes);
+				}
+			}
+		}
+	}
 
 	if (proto == IPPROTO_TCP && is_syn && cfg->syn_limit &&
 	    r->syn > cfg->syn_limit) {

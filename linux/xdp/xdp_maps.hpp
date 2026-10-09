@@ -150,13 +150,16 @@ struct XdpMaps {
     int cfg = -1;
     int stats = -1;
     int port_class = -1;
+    int port_limits = -1;
+    int port_rates = -1;
     std::string pin_dir = kXdpPinDir;
 
     bool attached() const { return prog >= 0; }
     int prog = -1;
 
     void Close() {
-        for (int* fd : {&blacklist, &whitelist, &rates, &cfg, &stats, &port_class, &prog}) {
+        for (int* fd : {&blacklist, &whitelist, &rates, &cfg, &stats, &port_class,
+                        &port_limits, &port_rates, &prog}) {
             if (*fd >= 0) {
                 close(*fd);
                 *fd = -1;
@@ -174,6 +177,7 @@ struct XdpMaps {
             {"blacklist", &blacklist}, {"whitelist", &whitelist},
             {"rates", &rates},         {"fw_cfg", &cfg},
             {"fw_stats_map", &stats},  {"port_class", &port_class},
+            {"port_limits", &port_limits}, {"port_rates", &port_rates},
         };
 
         for (auto& e : entries) {
@@ -321,6 +325,16 @@ struct XdpMaps {
         if (port_class < 0) return false;
         const uint32_t key = port;
         return bpf_sys::map_update(port_class, &key, &cls, BPF_ANY) == 0;
+    }
+
+    // Set the per-port PPS budget for a destination port (0 removes it).
+    bool SetPortLimit(uint16_t port, uint32_t pps_limit) {
+        if (port_limits < 0) return false;
+        const uint32_t key = port;
+        if (pps_limit == 0) {
+            return bpf_sys::map_delete(port_limits, &key) == 0 || errno == ENOENT;
+        }
+        return bpf_sys::map_update(port_limits, &key, &pps_limit, BPF_ANY) == 0;
     }
 
     // Read port classification type

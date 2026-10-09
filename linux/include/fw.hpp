@@ -3,7 +3,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -179,9 +181,19 @@ public:
     size_t size() const;
     void Clear();
 
+    // --- Durable store -----------------------------------------------------
+    // Userspace is the single source of truth for bans; the nft set and the XDP
+    // blacklist are derived views. The store survives daemon restart and reload.
+    void SetStorePath(const std::string& path);
+    bool Persist() const;   // write the active table to the store
+    bool Restore();         // load the store into the active table
+
 private:
+    void PersistLocked() const;
+
     mutable std::mutex mu_;
     std::unordered_map<uint32_t, BanEntry> bans_;
+    std::string store_path_;
 };
 
 // nftables management class
@@ -216,10 +228,24 @@ public:
     static bool RunScript(const std::string& script, std::string* out, std::string* err);
 };
 
-// NFQueue DPI packet inspection
+// NFQueue DPI packet inspection.
+// The config is passed as an immutable shared snapshot: the DPI thread owns a
+// reference for its whole lifetime, so a SIGHUP reload that swaps the daemon's
+// config cannot race with or free the object out from under the reader.
 bool DpiAvailable();
-void RunDpiLoop(Config& cfg, Counters& counters, std::atomic<uint64_t>& drops,
-                std::atomic<bool>& stop, uint16_t queue_num);
+void RunDpiLoop(std::shared_ptr<const Config> cfg, Counters& counters,
+                std::atomic<uint64_t>& drops, std::atomic<bool>& stop,
+                uint16_t queue_num);
+
+// --- Userspace, handshake-gated auto-ban -----------------------------------
+// Subscribes to kernel conntrack events and only escalates a source to a ban
+// AFTER it completes a TCP handshake (conntrack reaches ESTABLISHED). A spoofed
+// SYN never completes a handshake, so it can no longer blackhole a victim.
+// Optional build feature (HAVE_CONNTRACK); stubbed out otherwise.
+using BanCallback = std::function<bool(uint32_t ip_nbo, const std::string& reason)>;
+bool ConntrackAvailable();
+void RunConntrackLoop(std::shared_ptr<const Config> cfg, BanCallback on_ban,
+                      std::atomic<bool>& stop);
 
 // Host hardware identity
 std::string MachineHwid();

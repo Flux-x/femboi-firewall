@@ -10,7 +10,8 @@ Build-Depends:
  libbpf-dev,
  libelf-dev,
  bpftool,
- pkg-config
+ pkg-config,
+ libnetfilter-conntrack-dev
 Standards-Version: 4.6.2
 Homepage: https://github.com/FLUXXFALCON/femboi-firewall
 Rules-Requires-Root: binary-targets
@@ -24,6 +25,7 @@ Depends:
  iproute2,
  bpftool | linux-tools-common,
  libnetfilter-queue1,
+ libnetfilter-conntrack3,
  conntrack
 Recommends: geoip-database
 Suggests: apparmor

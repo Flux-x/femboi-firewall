@@ -372,7 +372,10 @@ int CmdList(const Config& cfg) {
 }
 
 struct EngineState {
-    Config cfg;
+    // Immutable snapshot swapped atomically on reload. Background threads that
+    // need the config take their own copy of this shared_ptr, so a reload can
+    // never free the object while they are reading it.
+    std::shared_ptr<const Config> cfg;
     GeoDb geo;
     AsnFilter asn;
     BanTable bans;
@@ -452,6 +455,21 @@ void SyncXdp(const Config& cfg, const std::set<uint32_t>& bans) {
         xdp.SetPortClass(p.port, cls);
     }
 
+    // Per-port PPS budgets, derived from the same rule the nftables tier uses
+    // (rate_limit is a percentage of the per-IP budget).
+    for (const auto& p : cfg.ports) {
+        if (p.port == 0) continue;
+        uint32_t limit = 0;
+        if (p.enabled && p.type != kPortSystem) {
+            limit = cfg.per_ip_pps;
+            if (p.rate_limit > 0 && p.rate_limit != 100) {
+                limit = (uint32_t)((uint64_t)cfg.per_ip_pps * p.rate_limit / 100);
+            }
+            if (limit < 10) limit = 10;
+        }
+        xdp.SetPortLimit(p.port, limit);
+    }
+
     std::set<uint32_t> present;
     for (const auto& row : xdp.ListBlocked(200000)) present.insert(row.ip_nbo);
 
@@ -517,13 +535,14 @@ bool ApplyAll(EngineState& st, bool log_it) {
     std::string err;
     Nft nft;
 
-    if (!nft.EnsureBase(st.cfg, &err)) {
+    if (!st.cfg) return false;
+    if (!nft.EnsureBase(*st.cfg, &err)) {
         Logf(0, "cannot install nftables ruleset: %s", err.c_str());
         return false;
     }
 
     // Trusted sources must be installed before any auto-ban rule can fire.
-    if (!nft.SyncWhitelist(st.cfg.whitelist, &err)) {
+    if (!nft.SyncWhitelist(st.cfg->whitelist, &err)) {
         Logf(1, "cannot sync whitelist: %s", err.c_str());
     }
 
@@ -534,15 +553,15 @@ bool ApplyAll(EngineState& st, bool log_it) {
         Logf(1, "cannot sync ban set: %s", err.c_str());
     }
 
-    if (st.cfg.datacenter_filter && st.asn.range_count() > 0) {
+    if (st.cfg->datacenter_filter && st.asn.range_count() > 0) {
         nft.SetDatacenterBlocks(st.asn.ranges(), &err);
     } else {
         nft.SetDatacenterBlocks({}, &err);
     }
 
-    if (st.cfg.geo_enabled && st.geo.loaded()) {
+    if (st.cfg->geo_enabled && st.geo.loaded()) {
         std::map<std::string, CountryRule> rules;
-        LoadGeoRules(st.cfg.rules_path, rules);
+        LoadGeoRules(st.cfg->rules_path, rules);
         const auto ranges = BuildGeoBlockRanges(st.geo, rules);
         nft.SetGeoBlocks(ranges, &err);
         const auto rate_ranges = BuildGeoRateRanges(st.geo, rules);
@@ -557,7 +576,7 @@ bool ApplyAll(EngineState& st, bool log_it) {
              active.size(), st.geo.size(), st.asn.range_count());
     }
 
-    SyncXdp(st.cfg, active);
+    SyncXdp(*st.cfg, active);
     return true;
 }
 
@@ -581,6 +600,80 @@ void MaintenanceThread(EngineState& st) {
     }
 }
 
+// --- DPI worker lifecycle ---------------------------------------------------
+// Owns the nfqueue thread and its own stop flag, so it can be torn down and
+// restarted on reload without signalling the global shutdown flag. Each worker
+// holds a shared_ptr to the exact config snapshot it was started with.
+struct DpiHandle {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> stop;
+    bool running = false;
+};
+
+void DpiStop(DpiHandle& h) {
+    if (!h.running) return;
+    if (h.stop) h.stop->store(true, std::memory_order_relaxed);
+    if (h.thread.joinable()) h.thread.join();
+    h.running = false;
+}
+
+void DpiStart(DpiHandle& h, const std::shared_ptr<const Config>& cfg,
+              Counters& counters, std::atomic<uint64_t>& drops) {
+    DpiStop(h);
+    if (!cfg || !cfg->dpi_enabled) return;
+    if (!DpiAvailable()) {
+        Logf(1, "DPI requested but unavailable (nfqueue missing or not compiled)");
+        return;
+    }
+    h.stop = std::make_shared<std::atomic<bool>>(false);
+    const uint16_t queue = cfg->dpi_queue;
+    h.thread = std::thread(RunDpiLoop, cfg, std::ref(counters), std::ref(drops),
+                           std::ref(*h.stop), queue);
+    h.running = true;
+    Logf(2, "DPI enabled on nfqueue %u", queue);
+}
+
+// --- Userspace handshake-gated auto-ban worker ------------------------------
+struct ConntrackHandle {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> stop;
+    bool running = false;
+};
+
+void ConntrackStop(ConntrackHandle& h) {
+    if (!h.running) return;
+    if (h.stop) h.stop->store(true, std::memory_order_relaxed);
+    if (h.thread.joinable()) h.thread.join();
+    h.running = false;
+}
+
+void ConntrackStart(ConntrackHandle& h, const std::shared_ptr<const Config>& cfg,
+                    EngineState& st) {
+    ConntrackStop(h);
+    if (!cfg || !cfg->auto_ban) return;
+    if (!ConntrackAvailable()) return;
+
+    h.stop = std::make_shared<std::atomic<bool>>(false);
+    // The callback runs on the conntrack thread; it records the ban in the
+    // durable store and applies it to both enforcement tiers.
+    BanCallback cb = [&st](uint32_t ip, const std::string& reason) -> bool {
+        const uint32_t ttl = st.cfg ? st.cfg->ban_seconds : 3600;
+        st.bans.Add(ip, 0, reason, (int64_t)ttl, 1, false);
+        Nft nft;
+        std::string err;
+        nft.AddBan(ip, ttl, &err);
+        if (st.cfg && st.cfg->xdp_enabled) {
+            XdpMaps xdp;
+            if (xdp.Open(st.cfg->xdp_pin_dir, nullptr)) {
+                xdp.BlockIp(ip, ttl, FW_BAN_PPS);
+            }
+        }
+        return true;
+    };
+    h.thread = std::thread(RunConntrackLoop, cfg, cb, std::ref(*h.stop));
+    h.running = true;
+}
+
 // Run main daemon loop
 int CmdDaemon(Config& cfg, const std::string& config_path) {
     if (geteuid() != 0) {
@@ -593,28 +686,31 @@ int CmdDaemon(Config& cfg, const std::string& config_path) {
     }
 
     EngineState st;
-    st.cfg = cfg;
+    st.cfg = std::make_shared<Config>(cfg);
     st.asn.Init();
+    // Durable ban store: userspace is the source of truth, restored on start.
+    st.bans.SetStorePath(cfg.state_dir + "/bans.db");
+    st.bans.Restore();
 
     std::string err;
-    if (!st.geo.Load(cfg.geoip_path, &err)) {
+    if (!st.geo.Load(st.cfg->geoip_path, &err)) {
         Logf(1, "geoip unavailable (%s)", err.c_str());
     }
 
     InstallSignals();
 
-    if (!cfg.enabled) {
+    if (!st.cfg->enabled) {
         // Stay resident and respond to SIGHUP so `set enabled 1` (which triggers
         // a reload) actually takes effect without a manual restart.
         Logf(1, "config disabled; waiting for reload");
         while (!g_stop.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             if (g_reload.exchange(false)) {
-                Config fresh = st.cfg;
+                auto fresh = std::make_shared<Config>(*st.cfg);
                 std::string e2;
-                if (fresh.Load(config_path, &e2)) {
+                if (fresh->Load(config_path, &e2)) {
                     st.cfg = fresh;
-                    if (st.cfg.enabled) {
+                    if (st.cfg->enabled) {
                         Logf(2, "enabled via reload");
                         break;
                     }
@@ -634,36 +730,36 @@ int CmdDaemon(Config& cfg, const std::string& config_path) {
     Logf(2, "running in standalone open-source mode");
 
     std::cout << "Femboi Firewall running in standalone mode. hwid=" << MachineHwid()
-              << " ports=" << cfg.ports.size() << std::endl;
+              << " ports=" << st.cfg->ports.size() << std::endl;
 
     std::vector<std::thread> workers;
     workers.emplace_back(MaintenanceThread, std::ref(st));
 
     std::atomic<uint64_t> dpi_drops{0};
-    if (cfg.dpi_enabled) {
-        if (DpiAvailable()) {
-            workers.emplace_back(RunDpiLoop, std::ref(st.cfg), std::ref(st.counters),
-                                 std::ref(dpi_drops), std::ref(g_stop), cfg.dpi_queue);
-            Logf(2, "DPI enabled on nfqueue %u", cfg.dpi_queue);
-        } else {
-            Logf(1, "DPI requested but not compiled");
-        }
-    }
+    DpiHandle dpi;
+    DpiStart(dpi, st.cfg, st.counters, dpi_drops);
+    ConntrackHandle ct;
+    ConntrackStart(ct, st.cfg, st);
 
     while (!g_stop.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         if (g_reload.exchange(false)) {
             Logf(2, "SIGHUP received, reloading config");
-            Config fresh = st.cfg;
+            // Build the new snapshot off to the side; only publish it once it
+            // parsed cleanly so a bad reload never disturbs the live config.
+            auto fresh = std::make_shared<Config>(*st.cfg);
             std::string e2;
-            // Reload the path the daemon was started with, not the hardcoded
-            // default, so `-c FILE` keeps working across reloads.
-            if (fresh.Load(config_path, &e2)) {
+            if (fresh->Load(config_path, &e2)) {
                 st.cfg = fresh;
                 // Fresh geo/datacenter data must be re-read on reload too.
-                st.geo.Load(st.cfg.geoip_path, nullptr);
+                st.geo.Load(st.cfg->geoip_path, nullptr);
                 st.asn.Init();
                 ApplyAll(st, true);
+                // Restart DPI/auto-ban against the new snapshot (old workers
+                // release their references on join), so toggling dpi_enabled or
+                // auto_ban takes effect.
+                DpiStart(dpi, st.cfg, st.counters, dpi_drops);
+                ConntrackStart(ct, st.cfg, st);
             } else {
                 Logf(1, "reload failed: %s", e2.c_str());
             }
@@ -672,6 +768,8 @@ int CmdDaemon(Config& cfg, const std::string& config_path) {
 
     Logf(2, "shutting down");
     g_stop.store(true);
+    DpiStop(dpi);
+    ConntrackStop(ct);
     for (auto& t : workers) {
         if (t.joinable()) t.join();
     }
@@ -797,6 +895,13 @@ int CmdBan(const Config& cfg, const std::vector<std::string>& rest) {
     }
     const std::string reason = rest.size() > 2 ? rest[2] : "manual";
 
+    // Record in the durable store first: it is the source of truth the daemon
+    // reconciles against, so a CLI ban survives a reload or restart.
+    BanTable store;
+    store.SetStorePath(cfg.state_dir + "/bans.db");
+    store.Restore();
+    store.Add(ip, 0, reason, ttl, 1, true);
+
     Nft nft;
     std::string e2;
     if (!nft.AddBan(ip, ttl > 0 ? (uint32_t)ttl : 0, &e2)) {
@@ -814,7 +919,7 @@ int CmdBan(const Config& cfg, const std::vector<std::string>& rest) {
  * @param rest Command-line arguments [ip].
  * @return 0 on success, non-zero error code on failure.
  */
-int CmdUnban(const std::vector<std::string>& rest) {
+int CmdUnban(const Config& cfg, const std::vector<std::string>& rest) {
     if (rest.empty()) {
         std::cerr << "usage: femboi-firewall unban <ip>\n";
         return 2;
@@ -824,6 +929,12 @@ int CmdUnban(const std::vector<std::string>& rest) {
         std::cerr << "error: invalid IPv4 address: " << rest[0] << "\n";
         return 2;
     }
+    // Remove from the durable store so the daemon does not re-apply the ban.
+    BanTable store;
+    store.SetStorePath(cfg.state_dir + "/bans.db");
+    store.Restore();
+    store.Remove(ip);
+
     Nft nft;
     std::string e2;
     nft.DelBan(ip, &e2);
@@ -921,7 +1032,7 @@ int CmdAdmin(const std::string& command, const Config& cfg, const std::vector<st
     }
     if (command == "list") return CmdList(cfg);
     if (command == "ban") return CmdBan(cfg, rest);
-    if (command == "unban") return CmdUnban(rest);
+    if (command == "unban") return CmdUnban(cfg, rest);
     if (command == "geo") return CmdGeo(cfg, rest);
     return 2;
 }
@@ -930,7 +1041,7 @@ int CmdAdmin(const std::string& command, const Config& cfg, const std::vector<st
 int CmdDispatch(const std::string& command, Config& cfg, const std::string& config_path, const std::vector<std::string>& rest) {
     if (command == "apply") {
         EngineState st;
-        st.cfg = cfg;
+        st.cfg = std::make_shared<Config>(cfg);
         st.asn.Init();
         st.geo.Load(cfg.geoip_path, nullptr);
         return ApplyAll(st, true) ? 0 : 1;

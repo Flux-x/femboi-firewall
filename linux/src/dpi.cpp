@@ -24,7 +24,8 @@ namespace femboifw {
 namespace {
 
 struct DpiContext {
-    Config* cfg = nullptr;
+    // Immutable snapshot for this thread's lifetime (see RunDpiLoop).
+    const Config* cfg = nullptr;
     Counters* counters = nullptr;
     std::atomic<uint64_t>* drops = nullptr;
 };
@@ -177,8 +178,10 @@ bool DpiAvailable() {
 }
 
 // Run nfqueue packet loop with a bounded, interruptible wait.
-void RunDpiLoop(Config& cfg, Counters& counters, std::atomic<uint64_t>& drops,
-                std::atomic<bool>& stop, uint16_t queue_num) {
+void RunDpiLoop(std::shared_ptr<const Config> cfg, Counters& counters,
+                std::atomic<uint64_t>& drops, std::atomic<bool>& stop,
+                uint16_t queue_num) {
+    if (!cfg) return;
     struct nfq_handle* h = nfq_open();
     if (!h) {
         Logf(0, "DPI: nfq_open failed (need root) — DPI disabled");
@@ -189,7 +192,7 @@ void RunDpiLoop(Config& cfg, Counters& counters, std::atomic<uint64_t>& drops,
     // (e.g. fail2ban), which could break those users on load.
 
     DpiContext ctx;
-    ctx.cfg = &cfg;
+    ctx.cfg = cfg.get();
     ctx.counters = &counters;
     ctx.drops = &drops;
 
@@ -259,8 +262,8 @@ namespace femboifw {
 bool DpiAvailable() { return false; }
 
 // Stub function when nfqueue unavailable
-void RunDpiLoop(Config&, Counters&, std::atomic<uint64_t>&, std::atomic<bool>&,
-                uint16_t) {
+void RunDpiLoop(std::shared_ptr<const Config>, Counters&, std::atomic<uint64_t>&,
+                std::atomic<bool>&, uint16_t) {
     Logf(1, "DPI requested but this build has no nfqueue support.");
 }
 

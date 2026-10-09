@@ -568,12 +568,14 @@ void BanTable::Add(uint32_t ip_nbo, uint16_t port, const std::string& reason,
         // Always record a manual escalation, even for an existing permanent
         // record, so `unban`/policy decisions see the operator intent.
         if (manual) it->second.manual = true;
-        if (it->second.expires_at == 0) return;
-        if (expires == 0) {
-            it->second.expires_at = 0;
-        } else if (expires > it->second.expires_at) {
-            it->second.expires_at = expires;
+        if (it->second.expires_at != 0) {
+            if (expires == 0) {
+                it->second.expires_at = 0;
+            } else if (expires > it->second.expires_at) {
+                it->second.expires_at = expires;
+            }
         }
+        PersistLocked();
         return;
     }
 
@@ -600,12 +602,15 @@ void BanTable::Add(uint32_t ip_nbo, uint16_t port, const std::string& reason,
     e.count = count;
     e.manual = manual;
     bans_[ip_nbo] = e;
+    PersistLocked();
 }
 
 // Remove IP from ban table
 bool BanTable::Remove(uint32_t ip_nbo) {
     std::lock_guard<std::mutex> lk(mu_);
-    return bans_.erase(ip_nbo) > 0;
+    const bool erased = bans_.erase(ip_nbo) > 0;
+    if (erased) PersistLocked();
+    return erased;
 }
 
 // Check if IP is currently banned
@@ -619,13 +624,16 @@ bool BanTable::Contains(uint32_t ip_nbo, int64_t now) const {
 // Expire outdated bans
 void BanTable::Sweep(int64_t now) {
     std::lock_guard<std::mutex> lk(mu_);
+    bool changed = false;
     for (auto it = bans_.begin(); it != bans_.end();) {
         if (it->second.expires_at != 0 && it->second.expires_at <= now) {
             it = bans_.erase(it);
+            changed = true;
         } else {
             ++it;
         }
     }
+    if (changed) PersistLocked();
 }
 
 // Snapshot active bans
@@ -668,6 +676,77 @@ size_t BanTable::size() const {
 void BanTable::Clear() {
     std::lock_guard<std::mutex> lk(mu_);
     bans_.clear();
+    PersistLocked();
+}
+
+// --- Durable ban store ------------------------------------------------------
+// Tab-separated, one active ban per line. Written atomically (temp + rename)
+// so a crash mid-write cannot corrupt the store.
+void BanTable::SetStorePath(const std::string& path) {
+    std::lock_guard<std::mutex> lk(mu_);
+    store_path_ = path;
+}
+
+void BanTable::PersistLocked() const {
+    if (store_path_.empty()) return;
+    const std::string tmp = store_path_ + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        if (!out) return;
+        out << "# femboi-firewall ban store v1\n";
+        out << "# ip<TAB>expires_at<TAB>manual<TAB>count<TAB>reason\n";
+        for (const auto& kv : bans_) {
+            const BanEntry& e = kv.second;
+            out << FormatIp(e.ip_nbo) << '\t' << e.expires_at << '\t'
+                << (e.manual ? 1 : 0) << '\t' << e.count << '\t' << e.reason << '\n';
+        }
+        out.flush();
+        if (!out) return;
+    }
+    std::rename(tmp.c_str(), store_path_.c_str());
+}
+
+bool BanTable::Persist() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    PersistLocked();
+    return true;
+}
+
+bool BanTable::Restore() {
+    std::lock_guard<std::mutex> lk(mu_);
+    bans_.clear();
+    if (store_path_.empty()) return false;
+    std::ifstream in(store_path_);
+    if (!in) return false;
+
+    const int64_t now = NowEpoch();
+    std::string line;
+    size_t loaded = 0;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const size_t t1 = line.find('\t');
+        const size_t t2 = t1 == std::string::npos ? std::string::npos : line.find('\t', t1 + 1);
+        const size_t t3 = t2 == std::string::npos ? std::string::npos : line.find('\t', t2 + 1);
+        const size_t t4 = t3 == std::string::npos ? std::string::npos : line.find('\t', t3 + 1);
+        if (t4 == std::string::npos) continue;
+
+        uint32_t ip = 0;
+        const std::string ip_str = line.substr(0, t1);
+        if (!ParseIp(ip_str, &ip)) continue;
+
+        BanEntry e;
+        e.ip_nbo = ip;
+        e.ip_str = ip_str;
+        e.expires_at = strtoll(line.substr(t1 + 1, t2 - t1 - 1).c_str(), nullptr, 10);
+        e.manual = line.substr(t2 + 1, t3 - t2 - 1) == "1";
+        e.count = atoi(line.substr(t3 + 1, t4 - t3 - 1).c_str());
+        e.reason = line.substr(t4 + 1);
+        if (e.expires_at != 0 && e.expires_at <= now) continue;  // already expired
+        bans_[ip] = e;
+        ++loaded;
+    }
+    Logf(2, "ban store: restored %zu active bans from %s", loaded, store_path_.c_str());
+    return true;
 }
 
 } // namespace femboifw

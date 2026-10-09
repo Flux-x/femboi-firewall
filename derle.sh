@@ -14,6 +14,7 @@ XDP_BIN_NAME="femboi-firewall-xdp"
 OBJ_DIR="bin/obj-linux"
 
 WITH_DPI=0
+WITH_CT=0
 DEBUG=0
 DO_INSTALL=0
 DO_CLEAN=0
@@ -23,13 +24,14 @@ WERROR="${CXX_WERROR:-0}"
 for arg in "$@"; do
     case "$arg" in
         --with-dpi) WITH_DPI=1 ;;
+        --with-conntrack) WITH_CT=1 ;;
         --debug)    DEBUG=1 ;;
         --install)  DO_INSTALL=1 ;;
         --clean)    DO_CLEAN=1 ;;
         --check)    CHECK_ONLY=1 ;;
         --werror)   WERROR=1 ;;
         -h|--help)
-            echo "Usage: ./derle.sh [--with-dpi] [--debug] [--install] [--clean] [--check] [--werror]"
+            echo "Usage: ./derle.sh [--with-dpi] [--with-conntrack] [--debug] [--install] [--clean] [--check] [--werror]"
             exit 0
             ;;
         *) echo "[!] Unknown option: $arg" >&2; exit 2 ;;
@@ -88,6 +90,28 @@ if [[ "$WITH_DPI" -eq 1 ]]; then
     fi
 fi
 
+# Detect optional libnetfilter_conntrack for userspace handshake-gated auto-ban.
+if [[ "$WITH_CT" -eq 1 ]]; then
+    HAVE_CT=0
+    if [[ -f /usr/include/libnetfilter_conntrack/libnetfilter_conntrack.h ]]; then
+        HAVE_CT=1
+    elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libnetfilter_conntrack; then
+        HAVE_CT=1
+    fi
+    if [[ "$HAVE_CT" -eq 1 ]]; then
+        if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libnetfilter_conntrack; then
+            LDLIBS+=($(pkg-config --libs libnetfilter_conntrack))
+            CFLAGS_NFQ+=($(pkg-config --cflags libnetfilter_conntrack))
+        else
+            LDLIBS+=(-lnetfilter_conntrack)
+        fi
+        DEFINES+=(-DHAVE_CONNTRACK)
+        ok "conntrack handshake auto-ban: enabled"
+    else
+        warn "conntrack missing libnetfilter_conntrack"
+    fi
+fi
+
 LDLIBS+=(-lpthread)
 
 BASE_FLAGS=(-std=c++17 -Wall -Wextra -Wno-unused-parameter -pthread
@@ -107,7 +131,7 @@ LDFLAGS=(-pie -Wl,-z,relro,-z,now)
 mkdir -p "$OUT_DIR" "$OBJ_DIR"
 
 SOURCES=("$SRC_DIR/util.cpp" "$SRC_DIR/engine.cpp" "$SRC_DIR/nft.cpp"
-         "$SRC_DIR/dpi.cpp" "$SRC_DIR/main.cpp")
+         "$SRC_DIR/dpi.cpp" "$SRC_DIR/conntrack.cpp" "$SRC_DIR/main.cpp")
 
 for f in "${SOURCES[@]}"; do
     [[ -f "$f" ]] || die "missing source: $f"

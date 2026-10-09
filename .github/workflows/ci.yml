@@ -26,8 +26,8 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential g++ clang llvm libbpf-dev libelf-dev bpftool \
-            nftables iproute2 libnetfilter-queue-dev pkg-config \
-            libgl1-mesa-dev libglfw3-dev libx11-dev shellcheck
+            nftables iproute2 libnetfilter-queue-dev libnetfilter-conntrack-dev \
+            pkg-config libgl1-mesa-dev libglfw3-dev libx11-dev shellcheck
 
       - name: Build daemon (--with-dpi, warnings as errors)
         run: |
@@ -35,9 +35,9 @@ jobs:
           # -Werror is enforced here so warnings cannot be silently hidden by
           # the build script's log redirection.
           CXXFLAGS="-Werror" bash -c '
-            CXX=g++ CXX_WERROR=1 ./derle.sh --with-dpi --check
+            CXX=g++ CXX_WERROR=1 ./derle.sh --with-dpi --with-conntrack --check
           '
-          ./derle.sh --with-dpi
+          ./derle.sh --with-dpi --with-conntrack
 
       - name: Unit tests
         run: make -C tools/tests test

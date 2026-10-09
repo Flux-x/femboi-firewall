@@ -81,6 +81,39 @@ static void test_bantable() {
     CHECK(!bt.Contains(ip, now + 3600));
 }
 
+static void test_ban_store_roundtrip() {
+    char path[] = "/tmp/femboi_banstoreXXXXXX";
+    const int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd < 0) return;
+    close(fd);
+
+    const int64_t now = NowEpoch();
+    {
+        BanTable bt;
+        bt.SetStorePath(path);
+        bt.Add(0x0A000001, 0, "perm-tag", 0, 1, true);   // 10.0.0.1 permanent
+        bt.Add(0x0A000002, 0, "temp", 3600);            // 10.0.0.2 for 1h
+    }
+
+    BanTable re;
+    re.SetStorePath(path);
+    CHECK(re.Restore());
+    CHECK(re.size() == 2);
+    CHECK(re.Contains(0x0A000001, now));
+    CHECK(re.Contains(0x0A000002, now));
+
+    // A manual flag must survive the round-trip.
+    const auto snap = re.Snapshot(now, 10);
+    bool manual_kept = false;
+    for (const auto& e : snap) {
+        if (e.ip_nbo == 0x0A000001 && e.manual) manual_kept = true;
+    }
+    CHECK(manual_kept);
+
+    unlink(path);
+}
+
 static void test_config_roundtrip() {
     char path[] = "/tmp/femboi_test_cfgXXXXXX";
     const int fd = mkstemp(path);
@@ -131,6 +164,7 @@ int main() {
     test_split_packet_order();
     test_connless_packet();
     test_bantable();
+    test_ban_store_roundtrip();
     test_config_roundtrip();
 
     if (g_failures == 0) {
