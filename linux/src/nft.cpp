@@ -77,12 +77,14 @@ bool Nft::RunScript(const std::string& script, std::string* out, std::string* er
 
 // Build the complete nftables script for the given config without applying it.
 // Exposed so tooling/CI can validate the generated ruleset with `nft -c -f -`.
-std::string Nft::BuildScript(const Config& cfg) {
+std::string Nft::BuildScript(const Config& cfg, bool include_reset) {
     std::ostringstream s;
 
-    // Flush prior table state
-    s << "add table " << kFamily << " " << kTable << "\n";
-    s << "delete table " << kFamily << " " << kTable << "\n";
+    if (include_reset) {
+        // Reset prior table state in the same `nft -f` transaction.
+        s << "add table " << kFamily << " " << kTable << "\n";
+        s << "delete table " << kFamily << " " << kTable << "\n";
+    }
 
     s << "table " << kFamily << " " << kTable << " {\n";
 

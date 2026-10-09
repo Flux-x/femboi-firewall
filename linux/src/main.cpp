@@ -163,7 +163,7 @@ void Usage() {
         "  apply  [-c FILE]     Install nftables ruleset\n"
         "  status [-c FILE]     Print firewall status JSON\n"
         "  ports  [-c FILE]     Print configured ports\n"
-        "  ruleset [-c FILE]    Print generated nftables script (dry-run with nft -c)\n"
+        "  ruleset [--no-reset] Print generated nftables script (dry-run with nft -c)\n"
         "  list                 List active bans\n"
         "  ban <ip> [secs]      Ban IP address\n"
         "  unban <ip>           Lift ban on IP address\n"
@@ -506,6 +506,9 @@ void WriteSysctlDropIn() {
         "net.ipv4.tcp_fin_timeout = 15\n"
         "net.ipv4.conf.all.accept_redirects = 0\n"
         "net.ipv4.conf.all.send_redirects = 0\n"
+        // Keep the conntrack table from filling under UDP/SYN floods.
+        "net.netfilter.nf_conntrack_max = 262144\n"
+        "net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 30\n"
         // NOTE: rp_filter is intentionally NOT set here.
         ;
 
@@ -1060,8 +1063,12 @@ int CmdDispatch(const std::string& command, Config& cfg, const std::string& conf
     if (command == "ruleset") {
         // Print the generated nftables script so it can be validated with
         // `nft -c -f -` (dry-run) in CI or by an operator before applying.
+        // --no-reset omits the add/delete preamble for validation, since
+        // `delete table` of a not-yet-existing table is not a syntax error but
+        // is awkward to dry-run on a clean host.
+        const bool no_reset = !rest.empty() && rest[0] == "--no-reset";
         Nft nft;
-        std::cout << nft.BuildScript(cfg);
+        std::cout << nft.BuildScript(cfg, !no_reset);
         return 0;
     }
     if (command == "set") {

@@ -100,7 +100,7 @@ sudo apt install -y build-essential nftables clang llvm libbpf-dev bpftool \
 ### 2. Build & Install Daemon
 
 ```bash
-git clone https://github.com/FLUXXFALCON/femboi-firewall.git
+git clone https://github.com/Flux-x/femboi-firewall.git
 cd femboi-firewall
 
 chmod +x derle.sh
@@ -202,6 +202,24 @@ derle.bat
 Output binaries are written to `bin/` (`femboi-firewall`, `femboi-firewall-xdp`).
 
 ---
+
+## Limitations
+
+- **Not a volumetric scrubber.** XDP/nftables mitigate application- and
+  connection-layer floods on a single host. A line-saturating (Gbps) attack must
+  be absorbed upstream by your provider's scrubbing/filtering — no on-box tool
+  can help once the pipe is full.
+- **IPv6 is currently passed, not filtered.** The ban/geo sets are IPv4 only;
+  IPv6 (including ICMPv6 control traffic) is explicitly accepted so nothing is
+  blackholed. Full IPv6 enforcement is on the roadmap.
+- **Per-IP limits do not stop distributed floods.** They only constrain a single
+  source; use them with, not instead of, upstream protection.
+
+## Security
+
+- Run the daemon as root only; it needs `CAP_NET_ADMIN`/`CAP_BPF`.
+- `derle.sh --install` installs root-owned files; review it before running.
+- Report issues via the repository's issue tracker.
 
 ## License
 

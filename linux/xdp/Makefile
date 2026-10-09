@@ -41,6 +41,11 @@ vmlinux:
 # Compile BPF object
 bpf: $(OBJ_TARGET)
 
+# Generate vmlinux.h on demand so `make bpf` works standalone (CI invokes it
+# directly, without the `check` target that normally kicks this off).
+vmlinux.h:
+	@$(MAKE) --no-print-directory vmlinux
+
 $(OBJ_TARGET): fw_xdp.c fw_common.h vmlinux.h
 	@mkdir -p $(OUT)
 	$(BPF_CLANG) $(BPF_CFLAGS) -c fw_xdp.c -o $@

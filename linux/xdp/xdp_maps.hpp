@@ -348,7 +348,7 @@ struct XdpMaps {
     bool ReadStats(struct fw_stats* out) const {
         if (stats < 0) return false;
 
-        const int ncpu = possible_cpus();
+        const int ncpu = bpf_sys::possible_cpus();
         if (ncpu <= 0 || ncpu > 4096) return false;
 
         std::vector<struct fw_stats> per(ncpu);

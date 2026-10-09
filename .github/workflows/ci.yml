@@ -45,7 +45,7 @@ jobs:
       - name: Validate generated nftables ruleset (nft -c -f)
         run: |
           set -o pipefail
-          ./bin/femboi-firewall ruleset | tee /tmp/femboi.nft | nft -c -f -
+          ./bin/femboi-firewall ruleset --no-reset | tee /tmp/femboi.nft | nft -c -f -
           echo "ruleset validated: $(wc -l < /tmp/femboi.nft) lines"
 
       - name: Build with ASan/UBSan and run unit tests
@@ -79,6 +79,8 @@ jobs:
             clang llvm libbpf-dev libelf-dev bpftool
       - name: Compile XDP object
         run: make -C linux/xdp bpf
+      - name: Compile XDP CLI
+        run: make -C linux/xdp cli
       - name: Load into the verifier (no attach)
         run: |
           set -o pipefail

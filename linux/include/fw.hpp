@@ -204,7 +204,10 @@ public:
 
     bool EnsureBase(const Config& cfg, std::string* err);
     // Generate the nftables ruleset script (without applying it).
-    std::string BuildScript(const Config& cfg);
+    // include_reset=false omits the `add/delete table` preamble so the script
+    // is pure definitions and can be validated with `nft -c -f -` without the
+    // table existing (used by CI).
+    std::string BuildScript(const Config& cfg, bool include_reset = true);
     static bool FlushAll();
 
     bool AddBan(uint32_t ip_nbo, uint32_t ttl_secs, std::string* err = nullptr);

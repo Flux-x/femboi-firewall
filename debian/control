@@ -13,7 +13,7 @@ Build-Depends:
  pkg-config,
  libnetfilter-conntrack-dev
 Standards-Version: 4.6.2
-Homepage: https://github.com/FLUXXFALCON/femboi-firewall
+Homepage: https://github.com/Flux-x/femboi-firewall
 Rules-Requires-Root: binary-targets
 
 Package: femboi-firewall

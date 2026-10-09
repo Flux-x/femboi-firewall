@@ -1,6 +1,6 @@
 [Unit]
 Description=Femboi Firewall DDoS mitigation engine
-Documentation=https://github.com/FLUXXFALCON/femboi-firewall
+Documentation=https://github.com/Flux-x/femboi-firewall
 # Start before the network is usable so protection exists from boot.
 After=network-pre.target
 Wants=network-pre.target

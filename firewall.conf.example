@@ -22,7 +22,9 @@ ports=27016/udp,27015/udp,80/tcp,443/tcp,8080/tcp
 whitelist=203.0.113.7,10.0.0.0/8
 
 # Drop new inbound connections from datacenter/VPS ranges.
-datacenter_filter=1
+# WARNING: this also blocks legitimate players on VPNs/hosting-based ISP egress.
+# Off by default; enable only if you do not care about those players.
+datacenter_filter=0
 
 # Enable country geo-filtering (see rules_path).
 geo_enabled=1
@@ -31,9 +33,10 @@ geo_enabled=1
 auto_ban=1
 ban_seconds=3600
 
-# Per source IP rate limits.
-per_ip_pps=1000
-rate_burst=2000
+# Per source IP rate limits. Keep these conservative: they only stop single-
+# source floods, not distributed ones (use upstream scrubbing for Gbps).
+per_ip_pps=400
+rate_burst=800
 
 # Userspace DPI packet inspection (requires a --with-dpi build).
 dpi_enabled=0
