@@ -24,8 +24,11 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
+          # NOTE: no `bpftool` here. It is a virtual package on some distros and
+          # absent on Debian 11; this job only builds userspace, so it does not
+          # need it. The XDP verifier-load job installs it explicitly.
           apt-get install -y --no-install-recommends \
-            build-essential g++ clang llvm libbpf-dev libelf-dev bpftool \
+            build-essential g++ clang llvm libbpf-dev libelf-dev \
             nftables iproute2 libnetfilter-queue-dev libnetfilter-conntrack-dev \
             pkg-config libgl1-mesa-dev libglfw3-dev libx11-dev shellcheck
 
@@ -72,18 +75,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Install BPF toolchain
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang llvm libbpf-dev libelf-dev bpftool
+            clang llvm libbpf-dev libelf-dev iproute2
+          # `bpftool` is a virtual package on Ubuntu, and on the Azure kernel
+          # the linux-tools package ships the /usr/sbin/bpftool wrapper without
+          # its payload, so `apt-get install bpftool` fails with "no
+          # installation candidate". Install the generic tools line and link
+          # its binary where the wrapper looks (upstream-recommended workaround).
+          KREL="$(uname -r)"
+          if ! /usr/sbin/bpftool -V >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends linux-tools-generic || true
+            FALLBACK="$(find /usr/lib -type f -name bpftool -perm -111 2>/dev/null \
+                        | sort -V | tail -n 1)"
+            if [[ -n "$FALLBACK" ]]; then
+              sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
+              sudo ln -sf "$FALLBACK" "/usr/lib/linux-tools/${KREL}/bpftool"
+            fi
+          fi
+          /usr/sbin/bpftool -V || echo "bpftool unusable; will load via iproute2"
+
       - name: Compile XDP object
         run: make -C linux/xdp bpf
+
       - name: Compile XDP CLI
         run: make -C linux/xdp cli
+
       - name: Load into the verifier (no attach)
         run: |
-          set -o pipefail
-          sudo bpftool prog load linux/bin/femboi_xdp.o /sys/fs/bpf/femboi_ci_test type xdp \
-            || { echo "verifier rejected program"; exit 1; }
-          sudo rm -f /sys/fs/bpf/femboi_ci_test
+          set -euo pipefail
+          obj=linux/bin/femboi_xdp.o
+          if /usr/sbin/bpftool -V >/dev/null 2>&1; then
+            # Preferred: load-only, which runs the verifier without attaching.
+            sudo /usr/sbin/bpftool prog load "$obj" /sys/fs/bpf/femboi_ci_test type xdp \
+              || { echo "verifier rejected program"; exit 1; }
+            sudo rm -f /sys/fs/bpf/femboi_ci_test
+          else
+            # Fallback: iproute2 loads through libbpf, exercising the verifier
+            # too, then we detach. Generic XDP is supported on lo everywhere.
+            sudo ip link set dev lo xdpgeneric obj "$obj" \
+              || { echo "verifier rejected program (via iproute2)"; exit 1; }
+            sudo ip link set dev lo xdp off
+          fi
+          echo "verifier accepted the program"
