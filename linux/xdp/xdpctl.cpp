@@ -183,7 +183,16 @@ int cmd_attach(const std::string& iface, const std::string& mode,
 
 // Cancel a pending rollback timer (one-shot marker consumed by the watchdog).
 int cmd_attach_confirm(const std::string& pin_dir) {
-    const std::string marker = pin_dir + "/rollback.cancel";
+    if (pin_dir.empty() || pin_dir.find("..") != std::string::npos) {
+        std::cerr << "error: invalid pin directory\n";
+        return 1;
+    }
+    char resolved[PATH_MAX];
+    if (realpath(pin_dir.c_str(), resolved) == nullptr) {
+        std::cerr << "error: pin directory not found: " << pin_dir << "\n";
+        return 1;
+    }
+    const std::string marker = std::string(resolved) + "/rollback.cancel";
     // Create with explicit 0600 rather than fopen's umask-dependent default:
     // the marker sits in the (root-owned) pin dir and grants whoever can
     // write it the ability to cancel a pending rollback, so keep it off-world.

@@ -110,31 +110,56 @@ inline bool is_allowed_binary(const std::string& arg0) {
     return proc_detail::is_allowed_name(base);
 }
 
-// Spawn a process without a shell. Returns true on exit status 0.
-// `timeout_ms` <= 0 disables the deadline. Captured output is capped at 4 MiB.
+/**
+ * @brief Executes an external binary safely without invoking an intermediate shell.
+ *
+ * This function handles subprocess execution with security guarantees:
+ * - Binary paths are strictly checked against a compile-time allowlist.
+ * - All pipes are created with O_CLOEXEC to prevent descriptor leaks into children.
+ * - posix_spawn is utilized instead of traditional fork/exec to avoid memory footprint spikes.
+ * - Standard input is streamed to the child, and standard output/error are captured up to 4 MiB.
+ * - A deadline watchdog guarantees that hanging processes are terminated (SIGTERM followed by SIGKILL).
+ *
+ * @param argv Command vector where argv[0] is the binary name or path.
+ * @param out Optional pointer to receive captured standard output.
+ * @param err Optional pointer to receive captured standard error or failure message.
+ * @param stdin_data Optional payload to pass into the child process standard input.
+ * @param timeout_ms Execution deadline in milliseconds; <= 0 disables timeout enforcement.
+ * @return true if the process exited with code 0, false otherwise.
+ */
 inline bool run_argv(const std::vector<std::string>& argv,
                      std::string* out, std::string* err,
                      const std::string& stdin_data = {},
                      int timeout_ms = 10000) {
+    // -------------------------------------------------------------------------
+    // Step 1: Input validation and binary allowlist verification
+    // -------------------------------------------------------------------------
     if (argv.empty()) {
         if (err) *err = "empty argv";
         return false;
     }
 
+    // Resolve binary path against approved executable names.
     const std::string exe = proc_detail::resolve_binary(argv[0]);
     if (exe.empty()) {
         if (err) *err = "refusing to execute non-allowlisted binary: " + argv[0];
         return false;
     }
 
+    // -------------------------------------------------------------------------
+    // Step 2: Create pipes for stdin, stdout, and stderr with close-on-exec
+    // -------------------------------------------------------------------------
     int in_pipe[2] = {-1, -1};
     int out_pipe[2] = {-1, -1};
     int err_pipe[2] = {-1, -1};
+
+    // Helper lambda to safely close all pipe file descriptors on error.
     auto close_all = [&]() {
         for (int fd : {in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]}) {
             if (fd >= 0) close(fd);
         }
     };
+
     if (pipe2(in_pipe, O_CLOEXEC) != 0 ||
         pipe2(out_pipe, O_CLOEXEC) != 0 ||
         pipe2(err_pipe, O_CLOEXEC) != 0) {
@@ -143,26 +168,38 @@ inline bool run_argv(const std::vector<std::string>& argv,
         return false;
     }
 
+    // -------------------------------------------------------------------------
+    // Step 3: Prepare argument array pointers for posix_spawn
+    // -------------------------------------------------------------------------
     std::vector<char*> cargv;
     cargv.reserve(argv.size() + 1);
     cargv.push_back(const_cast<char*>(exe.c_str()));
     for (size_t i = 1; i < argv.size(); ++i) cargv.push_back(const_cast<char*>(argv[i].c_str()));
     cargv.push_back(nullptr);
 
+    // -------------------------------------------------------------------------
+    // Step 4: Configure standard file descriptors for the spawned child
+    // -------------------------------------------------------------------------
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
+    // Bind child stdin, stdout, and stderr to pipe endpoints.
     posix_spawn_file_actions_adddup2(&actions, in_pipe[0], STDIN_FILENO);
     posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDOUT_FILENO);
     posix_spawn_file_actions_adddup2(&actions, err_pipe[1], STDERR_FILENO);
+    // Close parent endpoints in child context.
     posix_spawn_file_actions_addclose(&actions, in_pipe[1]);
     posix_spawn_file_actions_addclose(&actions, out_pipe[0]);
     posix_spawn_file_actions_addclose(&actions, err_pipe[0]);
 
+    // -------------------------------------------------------------------------
+    // Step 5: Launch the child process using posix_spawn
+    // -------------------------------------------------------------------------
     pid_t pid = 0;
     const int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr,
                                cargv.data(), proc_detail::minimal_env());
     posix_spawn_file_actions_destroy(&actions);
 
+    // Close endpoints used exclusively by the child process.
     close(in_pipe[0]);
     close(out_pipe[1]);
     close(err_pipe[1]);
@@ -175,13 +212,20 @@ inline bool run_argv(const std::vector<std::string>& argv,
         return false;
     }
 
+    // -------------------------------------------------------------------------
+    // Step 6: Initialize polling deadline and event tracking buffers
+    // -------------------------------------------------------------------------
     const uint64_t deadline = timeout_ms > 0 ? proc_detail::mono_ms() + (uint64_t)timeout_ms : 0;
     size_t stdin_off = 0;
     std::string captured, captured_err;
     bool in_open = true, out_open = true, err_open = true;
     bool timed_out = false;
 
+    // -------------------------------------------------------------------------
+    // Step 7: Event multiplexing loop (poll I/O until all descriptors close)
+    // -------------------------------------------------------------------------
     while (out_open || err_open || in_open) {
+        // Enforce execution timeout limit.
         if (deadline && proc_detail::mono_ms() > deadline) {
             timed_out = true;
             break;
@@ -190,6 +234,8 @@ inline bool run_argv(const std::vector<std::string>& argv,
         struct pollfd pfd[3];
         int n = 0;
         int idx_in = -1, idx_out = -1, idx_err = -1;
+
+        // Monitor stdin if there is pending data to transmit to the child.
         if (in_open && stdin_off < stdin_data.size()) {
             idx_in = n;
             pfd[n].fd = in_pipe[1];
@@ -197,12 +243,14 @@ inline bool run_argv(const std::vector<std::string>& argv,
             pfd[n].revents = 0;
             n++;
         } else if (in_open) {
-            // Nothing left to write: close the write end so the child sees EOF.
+            // Nothing left to write: close the write end so child receives EOF.
             close(in_pipe[1]);
             in_pipe[1] = -1;
             in_open = false;
             continue;
         }
+
+        // Monitor stdout for available chunks.
         if (out_open) {
             idx_out = n;
             pfd[n].fd = out_pipe[0];
@@ -210,6 +258,8 @@ inline bool run_argv(const std::vector<std::string>& argv,
             pfd[n].revents = 0;
             n++;
         }
+
+        // Monitor stderr for available error output.
         if (err_open) {
             idx_err = n;
             pfd[n].fd = err_pipe[0];
@@ -219,6 +269,7 @@ inline bool run_argv(const std::vector<std::string>& argv,
         }
         if (n == 0) break;
 
+        // Wait for descriptor activity with a 250ms polling resolution.
         const int pr = poll(pfd, (nfds_t)n, 250);
         if (pr < 0) {
             if (errno == EINTR) continue;
@@ -226,6 +277,7 @@ inline bool run_argv(const std::vector<std::string>& argv,
         }
         if (pr == 0) continue;
 
+        // Write chunk to child stdin when ready.
         if (idx_in >= 0 && (pfd[idx_in].revents & POLLOUT)) {
             const ssize_t w = write(in_pipe[1], stdin_data.data() + stdin_off,
                                     stdin_data.size() - stdin_off);
@@ -237,6 +289,7 @@ inline bool run_argv(const std::vector<std::string>& argv,
             }
         }
 
+        // Helper lambda to drain descriptor buffer up to 4 MiB capacity.
         auto drain = [&](int fd, std::string* dst, bool* open_flag) {
             char buf[8192];
             for (;;) {
@@ -256,19 +309,27 @@ inline bool run_argv(const std::vector<std::string>& argv,
             }
         };
 
+        // Drain stdout when data is available.
         if (idx_out >= 0 && (pfd[idx_out].revents & (POLLIN | POLLHUP)))
             drain(out_pipe[0], &captured, &out_open);
+
+        // Drain stderr when data is available.
         if (idx_err >= 0 && (pfd[idx_err].revents & (POLLIN | POLLHUP)))
             drain(err_pipe[0], &captured_err, &err_open);
     }
 
+    // Close remaining open descriptors.
     if (in_pipe[1] >= 0) close(in_pipe[1]);
     if (out_open) close(out_pipe[0]);
     if (err_open) close(err_pipe[0]);
 
     int status = 0;
+
+    // -------------------------------------------------------------------------
+    // Step 8: Handle timeout termination sequence if deadline was exceeded
+    // -------------------------------------------------------------------------
     if (timed_out) {
-        // Reap deterministically: ask nicely, then kill.
+        // First try gentle termination with SIGTERM.
         kill(pid, SIGTERM);
         for (int i = 0; i < 20; ++i) {
             pid_t r = waitpid(pid, &status, WNOHANG);
@@ -276,6 +337,7 @@ inline bool run_argv(const std::vector<std::string>& argv,
             struct timespec ts{0, 50 * 1000 * 1000};
             nanosleep(&ts, nullptr);
         }
+        // If still active, escalate to SIGKILL.
         if (waitpid(pid, &status, WNOHANG) == 0) {
             kill(pid, SIGKILL);
             while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
@@ -285,9 +347,13 @@ inline bool run_argv(const std::vector<std::string>& argv,
         return false;
     }
 
+    // Wait for normal child process exit.
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
     }
 
+    // -------------------------------------------------------------------------
+    // Step 9: Evaluate process exit status and format results
+    // -------------------------------------------------------------------------
     const bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
     if (ok) {
         if (out) *out = captured;

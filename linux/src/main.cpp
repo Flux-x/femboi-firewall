@@ -494,12 +494,28 @@ bool LoadGeoVerified(const Config& cfg, GeoDb& geo, std::string* err) {
     return geo.Load(cfg.geoip_path, err);
 }
 
-// Build the daemon-side control-socket handlers. The lambdas capture `&st`:
-// the server thread runs only while CmdDaemon's stack frame is alive.
+/**
+ * @brief Constructs the control socket endpoint handlers for the daemon.
+ *
+ * This factory function initializes dispatch callbacks for IPC control requests
+ * received over the local UNIX domain socket (/run/femboi/ctl.sock).
+ * Handlers are exposed for querying operational status, collecting real-time
+ * network telemetry and traffic counters, inspecting the active IP ban table,
+ * executing manual ban and unban actions across both nftables and XDP maps,
+ * and dynamically modifying runtime configuration parameters.
+ *
+ * @param st Reference to the engine state tracking active filters, bans, and metrics.
+ * @param config_path Filesystem path to the persistent configuration file.
+ * @return CtlHandlers Configured callback map ready for the IPC listener thread.
+ */
 CtlHandlers BuildCtlHandlers(EngineState& st, std::string config_path) {
     CtlHandlers h;
 
+    // -------------------------------------------------------------------------
+    // 1. Status Handler: Reports overall engine health, state, and feature flags
+    // -------------------------------------------------------------------------
     h.status = [&st]() {
+        // Read active configuration snapshot safely.
         auto cfg = st.cfg;
         std::ostringstream s;
         s << "{\"ok\":true"
@@ -515,10 +531,14 @@ CtlHandlers BuildCtlHandlers(EngineState& st, std::string config_path) {
         return s.str();
     };
 
+    // -------------------------------------------------------------------------
+    // 2. Stats Handler: Gathers traffic metrics, drop counters, and XDP telemetry
+    // -------------------------------------------------------------------------
     h.stats = [&st]() {
         struct fw_stats xs;
         memset(&xs, 0, sizeof(xs));
         bool have_xdp = false;
+        // Query XDP map counters if the kernel BPF datapath is active.
         if (st.cfg && st.cfg->xdp_enabled) {
             XdpMaps m;
             if (m.Open(st.cfg->xdp_pin_dir, nullptr)) have_xdp = m.ReadStats(&xs);
@@ -546,6 +566,9 @@ CtlHandlers BuildCtlHandlers(EngineState& st, std::string config_path) {
         return s.str();
     };
 
+    // -------------------------------------------------------------------------
+    // 3. List Handler: Formats snapshot of currently banned IP addresses as JSON
+    // -------------------------------------------------------------------------
     h.list = [&st]() {
         const int64_t now = NowEpoch();
         const auto rows = st.bans.Snapshot(now, 100000);
@@ -568,17 +591,26 @@ CtlHandlers BuildCtlHandlers(EngineState& st, std::string config_path) {
         return s.str();
     };
 
+    // -------------------------------------------------------------------------
+    // 4. Ban Handler: Manually blacklists an IP in memory, nftables and XDP maps
+    // -------------------------------------------------------------------------
     h.ban = [&st](const std::string& ip, long long ttl, const std::string& reason) -> std::string {
         uint32_t nip = 0;
+        // Verify valid IPv4 representation.
         if (!ParseIp(ip, &nip)) return CtlErr("invalid IPv4 address");
+        // Refuse to ban critical networking targets (localhost, multicast).
         if (is_local_or_loopback_ipv4(nip) || (ntohl(nip) & 0xF0000000u) == 0xE0000000u)
             return CtlErr("refusing to ban local/loopback/multicast address");
+        // Resolve effective time-to-live.
         const uint32_t eff = ttl > 0 ? (uint32_t)ttl
                                      : (st.cfg ? st.cfg->ban_seconds : 3600);
+        // Persist ban in daemon state table.
         st.bans.Add(nip, 0, reason, (int64_t)eff, 1, true);
+        // Synchronize with kernel nftables ban set.
         Nft nft;
         std::string e;
         nft.AddBan(nip, eff, &e);
+        // Synchronize with kernel XDP blacklist BPF map if running.
         if (st.cfg && st.cfg->xdp_enabled) {
             XdpMaps m;
             if (m.Open(st.cfg->xdp_pin_dir, nullptr)) m.BlockIp(nip, eff, FW_BAN_MANUAL);
@@ -588,13 +620,19 @@ CtlHandlers BuildCtlHandlers(EngineState& st, std::string config_path) {
         return s.str();
     };
 
+    // -------------------------------------------------------------------------
+    // 5. Unban Handler: Clears an IP from memory, nftables rules and XDP tables
+    // -------------------------------------------------------------------------
     h.unban = [&st](const std::string& ip) -> std::string {
         uint32_t nip = 0;
         if (!ParseIp(ip, &nip)) return CtlErr("invalid IPv4 address");
+        // Erase from userspace memory table.
         st.bans.Remove(nip);
+        // Erase from kernel nftables set.
         Nft nft;
         std::string e;
         nft.DelBan(nip, &e);
+        // Erase from kernel XDP blacklist map.
         if (st.cfg) {
             XdpMaps m;
             if (m.Open(st.cfg->xdp_pin_dir, nullptr)) m.UnblockIp(nip, nullptr);
@@ -602,14 +640,18 @@ CtlHandlers BuildCtlHandlers(EngineState& st, std::string config_path) {
         return std::string("{\"ok\":true,\"ip\":\"") + EscapeJson(ip) + "\"}";
     };
 
+    // -------------------------------------------------------------------------
+    // 6. Set Handler: Mutates a configuration parameter and notifies the daemon
+    // -------------------------------------------------------------------------
     h.set = [&st, config_path](const std::string& key, const std::string& value) -> std::string {
         if (!st.cfg) return CtlErr("no active config");
         Config copy = *st.cfg;
+        // Parse and validate configuration assignment.
         if (!ApplySetting(copy, key, value)) return CtlErr("unknown setting or bad value: " + key);
         std::string err;
+        // Write atomically to persistent disk file.
         if (!copy.Save(config_path, &err)) return CtlErr("save failed: " + err);
-        // Ask the daemon loop to reload so the change takes effect without an
-        // external systemctl round-trip.
+        // Signal the main engine loop to reload config without restarting service.
         g_reload.store(true, std::memory_order_relaxed);
         return std::string("{\"ok\":true,\"key\":\"") + EscapeJson(key) +
                "\",\"value\":\"" + EscapeJson(value) + "\"}";

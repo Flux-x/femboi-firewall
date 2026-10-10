@@ -339,9 +339,8 @@ bool Config::Save(const std::string& path, std::string* err) const {
         fsync(fd);
         close(fd);
     }
-    if (::chmod(tmp.c_str(), 0600) != 0) {
-        // Non-fatal: best effort to tighten permissions.
-    }
+    // Best effort tighten permissions; failure is non-fatal since file is written
+    (void)::chmod(tmp.c_str(), 0600);
     if (std::rename(tmp.c_str(), dest.c_str()) != 0) {
         if (err) *err = "cannot replace " + dest;
         return false;

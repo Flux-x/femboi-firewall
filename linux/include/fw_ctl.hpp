@@ -59,7 +59,7 @@ struct CtlRateLimiter {
 // Server loop. Binds sock_path (mode 0660, group `femboi` when it exists),
 // accepts connections and serves them until `stop` is set. Blocking; run it on
 // its own thread. The parent directory is created (mode 0750) if missing.
-void RunCtlServer(const std::string& sock_path, CtlHandlers handlers,
+void RunCtlServer(const std::string& sock_path, const CtlHandlers& handlers,
                   std::atomic<bool>& stop);
 
 } // namespace femboifw

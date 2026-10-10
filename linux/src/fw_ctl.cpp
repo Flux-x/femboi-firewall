@@ -285,7 +285,7 @@ bool CtlRateLimiter::Allow(uint64_t now_ns) {
     return false;
 }
 
-void RunCtlServer(const std::string& sock_path, CtlHandlers handlers,
+void RunCtlServer(const std::string& sock_path, const CtlHandlers& handlers,
                   std::atomic<bool>& stop) {
     const size_t slash = sock_path.find_last_of('/');
     if (slash != std::string::npos && slash > 0) {
