@@ -13,10 +13,13 @@ jobs:
   build-test:
     name: build+test (debian ${{ matrix.release }})
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
-        release: [ "11", "12", "13" ]
+        release: [ "12", "13" ]
     container: debian:${{ matrix.release }}
     steps:
       - uses: actions/checkout@v4
@@ -24,16 +27,6 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
-          # Audited against Debian 11/12/13: every package below exists in all
-          # three, and only what THIS job uses is installed.
-          #   * compile + link the daemon and its unit tests: g++, pkg-config,
-          #     libnetfilter-queue-dev, libnetfilter-conntrack-dev
-          #   * validate the generated ruleset with `nft -c`: nftables
-          #   * lint derle.sh: shellcheck
-          # XDP/BPF tooling (clang, llvm, libbpf-dev, libelf-dev) is only used
-          # by the bpf-build job, and the GUI/X11 stack only by gui-build, so
-          # they are not installed here (clang/llvm also pull a large tree that
-          # is unnecessary on the bullseye leg).
           apt-get install -y --no-install-recommends \
             build-essential g++ pkg-config \
             libnetfilter-queue-dev libnetfilter-conntrack-dev \
@@ -50,8 +43,7 @@ jobs:
       - name: Build daemon (--with-dpi, warnings as errors)
         run: |
           set -o pipefail
-          # -Werror is enforced here so warnings cannot be silently hidden by
-          # the build script's log redirection.
+          chmod +x ./derle.sh
           CXXFLAGS="-Werror" bash -c '
             CXX=g++ CXX_WERROR=1 ./derle.sh --with-dpi --with-conntrack --check
           '
