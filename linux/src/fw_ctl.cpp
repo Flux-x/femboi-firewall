@@ -328,8 +328,9 @@ void RunCtlServer(const std::string& sock_path, const CtlHandlers& handlers,
     bool have_group = false;
     if (struct group* g = ::getgrnam("femboi")) {
         femboi_gid = g->gr_gid;
-        have_group = true;
-        ::chown(sock_path.c_str(), 0, femboi_gid);
+        if (::chown(sock_path.c_str(), 0, femboi_gid) != 0) {
+            Logf(3, "ctl: chown %s to gid %u failed: %s", sock_path.c_str(), static_cast<unsigned>(femboi_gid), strerror(errno));
+        }
     }
 
     if (::listen(sfd, 16) != 0) {
