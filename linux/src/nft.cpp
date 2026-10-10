@@ -144,6 +144,9 @@ std::string Nft::BuildScript(const Config& cfg, bool include_reset) {
     // in the input chain instead.
     s << "  chain prerouting {\n"
          "    type filter hook prerouting priority -310; policy accept;\n"
+         "    iif lo accept\n"
+         "    iifname \"tailscale0\" accept\n"
+         "    meta nfproto ipv4 ip saddr @whitelist accept\n"
          "    meta nfproto ipv4 ip saddr @banned drop\n"
          "    meta nfproto ipv4 ip saddr . th dport @banned_ports drop\n"
          "  }\n";
@@ -162,6 +165,7 @@ std::string Nft::BuildScript(const Config& cfg, bool include_reset) {
          "    ip saddr 127.0.0.0/8 accept\n"
          "\n"
          "    iifname \"tailscale0\" accept\n"
+         "    tcp dport 3389 accept comment \"rdp-bypass\"\n"
          "\n"
          // Trusted sources bypass every limit and auto-ban path.
          "    meta nfproto ipv4 ip saddr @whitelist counter accept comment \"whitelist\"\n"
@@ -206,8 +210,8 @@ std::string Nft::BuildScript(const Config& cfg, bool include_reset) {
          // still trigger a ban of a third-party address; operators who expose
          // these ports must populate `whitelist`. Kept conservative: no ban
          // storm from a single packet thanks to the meter.
-         "    tcp dport { 21, 23, 25, 110, 135, 139, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200 } ct state new meter mgmt_sweep { ip saddr limit rate over 4/minute burst 8 packets } log prefix \"femboifw mgmt-sweep \" update @banned { ip saddr timeout 1h } counter drop\n"
-         "    tcp dport { 21, 23, 25, 110, 135, 139, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200 } counter drop\n"
+         "    tcp dport { 21, 23, 25, 110, 135, 139, 445, 1433, 1521, 3306, 5432, 5900, 6379, 9200 } ct state new meter mgmt_sweep { ip saddr limit rate over 4/minute burst 8 packets } log prefix \"femboifw mgmt-sweep \" update @banned { ip saddr timeout 1h } counter drop\n"
+         "    tcp dport { 21, 23, 25, 110, 135, 139, 445, 1433, 1521, 3306, 5432, 5900, 6379, 9200 } counter drop\n"
          "    udp dport { 137, 138, 139, 1434, 1900, 5353 } counter drop\n"
          "\n"
          "    udp sport { 17, 19, 53, 69, 111, 123, 137, 138, 161, 389, 520, 1434, 1900, 3283, 3478, 3702, 5093, 5351, 5353, 11211, 27010-27014 } ct state new counter drop\n"
