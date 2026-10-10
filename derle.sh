@@ -48,7 +48,7 @@ die()  { err "$*"; exit 1; }
 # Remove build output artifacts
 if [[ "$DO_CLEAN" -eq 1 ]]; then
     say "Cleaning build artifacts..."
-    rm -rf "$OBJ_DIR" "$OUT_DIR/$BIN_NAME" "$OUT_DIR/$XDP_BIN_NAME"
+    rm -rf "${OBJ_DIR:?}" "${OUT_DIR:?}/${BIN_NAME:?}" "${OUT_DIR:?}/${XDP_BIN_NAME:?}"
     ok "Clean."
     [[ $# -eq 1 ]] && exit 0
 fi
@@ -76,8 +76,9 @@ fi
 if [[ "$WITH_DPI" -eq 1 ]]; then
     if [[ "$HAVE_NFQ" -eq 1 ]]; then
         if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libnetfilter_queue; then
-            LDLIBS+=($(pkg-config --libs libnetfilter_queue))
-            CFLAGS_NFQ=($(pkg-config --cflags libnetfilter_queue))
+            mapfile -t _nfq_libs < <(pkg-config --libs libnetfilter_queue)
+            LDLIBS+=("${_nfq_libs[@]}")
+            mapfile -t CFLAGS_NFQ < <(pkg-config --cflags libnetfilter_queue)
         else
             LDLIBS+=(-lnetfilter_queue -lnfnetlink)
             CFLAGS_NFQ=()
@@ -100,8 +101,10 @@ if [[ "$WITH_CT" -eq 1 ]]; then
     fi
     if [[ "$HAVE_CT" -eq 1 ]]; then
         if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libnetfilter_conntrack; then
-            LDLIBS+=($(pkg-config --libs libnetfilter_conntrack))
-            CFLAGS_NFQ+=($(pkg-config --cflags libnetfilter_conntrack))
+            mapfile -t _ct_libs < <(pkg-config --libs libnetfilter_conntrack)
+            LDLIBS+=("${_ct_libs[@]}")
+            mapfile -t _ct_cflags < <(pkg-config --cflags libnetfilter_conntrack)
+            CFLAGS_NFQ+=("${_ct_cflags[@]}")
         else
             LDLIBS+=(-lnetfilter_conntrack)
         fi
@@ -126,7 +129,7 @@ else
     BASE_FLAGS+=(-O2 -DNDEBUG -fstack-protector-strong -D_FORTIFY_SOURCE=2)
 fi
 BASE_FLAGS+=(-fPIE -fstack-clash-protection)
-LDFLAGS=(-pie -Wl,-z,relro,-z,now)
+LDFLAGS=(-pie "-Wl,-z,relro,-z,now")
 
 mkdir -p "$OUT_DIR" "$OBJ_DIR"
 
@@ -156,7 +159,7 @@ for f in "${SOURCES[@]}"; do
         printf '%sFAIL%s\n' "$c_err" "$c_reset"
         echo
         err "compilation failed:"
-        cat "$obj.log" | head -60
+        head -n 60 "$obj.log"
         exit 1
     fi
 done
@@ -174,7 +177,7 @@ else
     printf '%sFAIL%s\n' "$c_err" "$c_reset"
     echo
     err "compilation failed:"
-    cat "$XDP_OBJ.log" | head -60
+    head -n 60 "$XDP_OBJ.log"
     exit 1
 fi
 
@@ -243,7 +246,9 @@ if [[ "$DO_INSTALL" -eq 1 ]]; then
     if [[ -f deploy/femboi-firewall.service ]]; then
         install -m 0644 deploy/femboi-firewall.service /lib/systemd/system/femboi-firewall.service
         ok "Installed /lib/systemd/system/femboi-firewall.service"
-        command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
     else
         warn "deploy/femboi-firewall.service missing; systemd unit not installed"
     fi
