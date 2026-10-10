@@ -20,7 +20,9 @@ jobs:
       fail-fast: false
       matrix:
         release: [ "12", "13" ]
-    container: debian:${{ matrix.release }}
+    container:
+      image: debian:${{ matrix.release }}
+      options: --cap-add=NET_ADMIN
     steps:
       - uses: actions/checkout@v4
 
@@ -54,8 +56,8 @@ jobs:
 
       - name: Validate generated nftables ruleset (nft -c -f)
         run: |
-          set -o pipefail
-          ./bin/femboi-firewall ruleset --no-reset | tee /tmp/femboi.nft | nft -c -f -
+          ./bin/femboi-firewall ruleset --no-reset > /tmp/femboi.nft
+          nft -c -f /tmp/femboi.nft || { echo "Generated ruleset dump:"; cat -n /tmp/femboi.nft; exit 1; }
           echo "ruleset validated: $(wc -l < /tmp/femboi.nft) lines"
 
       - name: Build with ASan/UBSan and run unit tests
