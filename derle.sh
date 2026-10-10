@@ -76,9 +76,9 @@ fi
 if [[ "$WITH_DPI" -eq 1 ]]; then
     if [[ "$HAVE_NFQ" -eq 1 ]]; then
         if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libnetfilter_queue; then
-            mapfile -t _nfq_libs < <(pkg-config --libs libnetfilter_queue)
+            read -r -a _nfq_libs <<< "$(pkg-config --libs libnetfilter_queue)"
             LDLIBS+=("${_nfq_libs[@]}")
-            mapfile -t CFLAGS_NFQ < <(pkg-config --cflags libnetfilter_queue)
+            read -r -a CFLAGS_NFQ <<< "$(pkg-config --cflags libnetfilter_queue)"
         else
             LDLIBS+=(-lnetfilter_queue -lnfnetlink)
             CFLAGS_NFQ=()
@@ -101,9 +101,9 @@ if [[ "$WITH_CT" -eq 1 ]]; then
     fi
     if [[ "$HAVE_CT" -eq 1 ]]; then
         if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libnetfilter_conntrack; then
-            mapfile -t _ct_libs < <(pkg-config --libs libnetfilter_conntrack)
+            read -r -a _ct_libs <<< "$(pkg-config --libs libnetfilter_conntrack)"
             LDLIBS+=("${_ct_libs[@]}")
-            mapfile -t _ct_cflags < <(pkg-config --cflags libnetfilter_conntrack)
+            read -r -a _ct_cflags <<< "$(pkg-config --cflags libnetfilter_conntrack)"
             CFLAGS_NFQ+=("${_ct_cflags[@]}")
         else
             LDLIBS+=(-lnetfilter_conntrack)
