@@ -6,14 +6,19 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <fstream>
+#include <map>
 #include <sstream>
 #include <vector>
 
@@ -89,6 +94,40 @@ std::string ReadRequestLine(int fd) {
     if (nl != std::string::npos) buf.resize(nl);
     while (!buf.empty() && (buf.back() == '\r')) buf.pop_back();
     return buf;
+}
+
+// Monotonic clock in nanoseconds (drives the rate limiters).
+uint64_t MonoNs() {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// Read the peer's supplementary groups from /proc/<pid>/status. SO_PEERCRED
+// reports only the primary gid, so a user added with `usermod -aG femboi`
+// (a supplementary group) would otherwise be rejected.
+bool PeerHasGroup(pid_t pid, gid_t gid) {
+    std::ifstream in("/proc/" + std::to_string((long long)pid) + "/status");
+    if (!in) return false;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("Groups:", 0) != 0) continue;
+        std::istringstream ss(line.substr(7));
+        unsigned long v = 0;
+        while (ss >> v) {
+            if ((gid_t)v == gid) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+// Authorization decision for a peer, given the resolved `femboi` gid.
+bool PeerAllowed(const struct ucred& cred, gid_t femboi_gid, bool have_group) {
+    if (cred.uid == 0 || cred.uid == ::geteuid()) return true;
+    if (!have_group) return false;
+    if (cred.gid == femboi_gid) return true;
+    return PeerHasGroup(cred.pid, femboi_gid);
 }
 
 } // namespace
@@ -224,32 +263,27 @@ std::string CtlClientCall(const std::string& sock_path, const std::string& reque
     return resp;
 }
 
-namespace {
-
-// Serve a single accepted connection. Returns false if the peer is unauthorized.
-bool ServeConnection(int cfd, const CtlHandlers& h, const std::string& who) {
-    const std::string line = ReadRequestLine(cfd);
-    std::string resp;
-    if (line.empty()) {
-        resp = ErrJson("empty request");
-    } else {
-        resp = HandleCtlLine(line, h);
-    }
-    (void)who;
-    resp.push_back('\n');
-    size_t off = 0;
-    while (off < resp.size()) {
-        const ssize_t n = ::write(cfd, resp.data() + off, resp.size() - off);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        off += (size_t)n;
-    }
-    return true;
+void CtlRateLimiter::Configure(double rate, double burst_tokens) {
+    rate_per_sec = rate > 0.0 ? rate : 1.0;
+    burst = burst_tokens > 0.0 ? burst_tokens : 1.0;
+    tokens = burst;
+    last_ns = 0;
 }
 
-} // namespace
+bool CtlRateLimiter::Allow(uint64_t now_ns) {
+    if (last_ns == 0) last_ns = now_ns;
+    const int64_t delta = (int64_t)(now_ns - last_ns);
+    if (delta > 0) {
+        tokens += (double)delta / 1e9 * rate_per_sec;
+        if (tokens > burst) tokens = burst;
+        last_ns = now_ns;
+    }
+    if (tokens >= 1.0) {
+        tokens -= 1.0;
+        return true;
+    }
+    return false;
+}
 
 void RunCtlServer(const std::string& sock_path, CtlHandlers handlers,
                   std::atomic<bool>& stop) {
@@ -290,8 +324,13 @@ void RunCtlServer(const std::string& sock_path, CtlHandlers handlers,
     ::chmod(sock_path.c_str(), 0660);
     // Group ownership lets an unprivileged GUI member of `femboi` connect while
     // keeping the socket off-world. Absent the group the socket stays root:root.
-    struct group* g = ::getgrnam("femboi");
-    if (g) ::chown(sock_path.c_str(), 0, g->gr_gid);
+    gid_t femboi_gid = 0;
+    bool have_group = false;
+    if (struct group* g = ::getgrnam("femboi")) {
+        femboi_gid = g->gr_gid;
+        have_group = true;
+        ::chown(sock_path.c_str(), 0, femboi_gid);
+    }
 
     if (::listen(sfd, 16) != 0) {
         Logf(0, "ctl: listen failed: %s", strerror(errno));
@@ -301,6 +340,12 @@ void RunCtlServer(const std::string& sock_path, CtlHandlers handlers,
     }
 
     Logf(2, "ctl: control socket listening at %s", sock_path.c_str());
+
+    // Global + per-uid token buckets bound the request rate so a runaway or
+    // hostile local client cannot spin the daemon.
+    CtlRateLimiter global_rl;
+    global_rl.Configure(100.0, 100.0);
+    std::map<uid_t, CtlRateLimiter> per_uid;
 
     while (!stop.load(std::memory_order_relaxed)) {
         struct pollfd pfd;
@@ -331,15 +376,44 @@ void RunCtlServer(const std::string& sock_path, CtlHandlers handlers,
             ::close(cfd);
             continue;
         }
-        if (cred.uid != 0 && cred.uid != ::geteuid()) {
-            Logf(1, "ctl: refusing request from uid %u", (unsigned)cred.uid);
+        if (!PeerAllowed(cred, femboi_gid, have_group)) {
+            Logf(1, "ctl: refusing request from uid %u gid %u",
+                 (unsigned)cred.uid, (unsigned)cred.gid);
             const std::string deny = ErrJson("permission denied") + "\n";
             (void)!::write(cfd, deny.data(), deny.size());
             ::close(cfd);
             continue;
         }
 
-        ServeConnection(cfd, handlers, "peer");
+        const uint64_t now = MonoNs();
+        CtlRateLimiter& rl = per_uid[cred.uid];
+        if (rl.last_ns == 0) rl.Configure(20.0, 40.0);
+        if (!global_rl.Allow(now) || !rl.Allow(now)) {
+            Logf(1, "ctl: rate-limited uid=%u", (unsigned)cred.uid);
+            const std::string deny = ErrJson("rate limited") + "\n";
+            (void)!::write(cfd, deny.data(), deny.size());
+            ::close(cfd);
+            continue;
+        }
+
+        const std::string line = ReadRequestLine(cfd);
+        // Per-request audit log. Length is bounded so a hostile client cannot
+        // inflate the log via an oversized request line.
+        Logf(2, "ctl: uid=%u pid=%u cmd=%.200s", (unsigned)cred.uid,
+             (unsigned)cred.pid, line.c_str());
+
+        std::string resp = line.empty() ? ErrJson("empty request")
+                                        : HandleCtlLine(line, handlers);
+        resp.push_back('\n');
+        size_t off = 0;
+        while (off < resp.size()) {
+            const ssize_t n = ::write(cfd, resp.data() + off, resp.size() - off);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            off += (size_t)n;
+        }
         ::close(cfd);
     }
 

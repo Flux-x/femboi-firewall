@@ -173,6 +173,26 @@ static void test_l7_automaton() {
     CHECK(!l7_ac_has_match("HELLO WORLD", 11));
 }
 
+static void test_ctl_rate_limiter() {
+    CtlRateLimiter rl;
+    rl.Configure(2.0, 4.0);  // 2 tokens/s sustained, burst 4
+    uint64_t t = 1000000000ull;
+
+    int allowed = 0;
+    for (int i = 0; i < 10; i++) {
+        if (rl.Allow(t)) allowed++;
+    }
+    CHECK(allowed == 4);  // drained to the burst with no time elapsed
+
+    t += 1000000000ull;   // one second later: +2 tokens
+    CHECK(rl.Allow(t));
+    CHECK(rl.Allow(t));
+    CHECK(!rl.Allow(t));
+
+    // A clock that does not advance must not refill the bucket.
+    CHECK(!rl.Allow(t));
+}
+
 static void test_ctl_dispatch() {
     // The control-socket request parser routes verbs and splits optional
     // ttl/reason fields exactly as the CLI does.
@@ -216,6 +236,7 @@ int main() {
     test_ban_store_roundtrip();
     test_config_roundtrip();
     test_l7_automaton();
+    test_ctl_rate_limiter();
     test_ctl_dispatch();
 
     if (g_failures == 0) {

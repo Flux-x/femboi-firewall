@@ -6,10 +6,16 @@
 // component that touches nftables/XDP and the config, so the GUI no longer needs
 // to shell out to `nft`/`conntrack` or write /etc/femboi directly.
 //
-// Authorization: every connection is checked with SO_PEERCRED; only uid 0 or the
-// daemon's own uid (or a member of the socket's group) may issue commands. There
-// is no TCP listener.
+// Authorization: every connection is checked with SO_PEERCRED (unspoofable).
+// A peer is allowed if it is uid 0, the daemon's own uid, or belongs to the
+// `femboi` group — as its primary gid or via any supplementary group (read from
+// /proc/<pid>/status). There is no TCP listener.
+//
+// Every accepted request is audit-logged, and both a global and a per-uid token
+// bucket bound the request rate so a runaway or hostile local client cannot
+// spin the daemon doing work.
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -37,9 +43,22 @@ std::string HandleCtlLine(const std::string& line, const CtlHandlers& h);
 // Client side: send one request, return the response line ("" on any failure).
 std::string CtlClientCall(const std::string& sock_path, const std::string& request);
 
-// Server loop. Binds sock_path (mode 0660), accepts connections and serves them
-// until `stop` is set. Blocking; run it on its own thread. The parent directory
-// is created (mode 0750) if missing.
+// Token-bucket rate limiter. Time is supplied by the caller (monotonic
+// nanoseconds) so the behaviour is deterministic and unit-testable.
+struct CtlRateLimiter {
+    double rate_per_sec = 20.0;  // sustained refill rate
+    double burst = 40.0;         // bucket capacity (max instantaneous)
+    double tokens = 40.0;
+    uint64_t last_ns = 0;
+
+    void Configure(double rate, double burst_tokens);
+    // Consume one token; false when the caller is over its budget.
+    bool Allow(uint64_t now_ns);
+};
+
+// Server loop. Binds sock_path (mode 0660, group `femboi` when it exists),
+// accepts connections and serves them until `stop` is set. Blocking; run it on
+// its own thread. The parent directory is created (mode 0750) if missing.
 void RunCtlServer(const std::string& sock_path, CtlHandlers handlers,
                   std::atomic<bool>& stop);
 
