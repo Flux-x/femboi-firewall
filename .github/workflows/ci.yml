@@ -24,13 +24,28 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
-          # NOTE: no `bpftool` here. It is a virtual package on some distros and
-          # absent on Debian 11; this job only builds userspace, so it does not
-          # need it. The XDP verifier-load job installs it explicitly.
+          # Audited against Debian 11/12/13: every package below exists in all
+          # three, and only what THIS job uses is installed.
+          #   * compile + link the daemon and its unit tests: g++, pkg-config,
+          #     libnetfilter-queue-dev, libnetfilter-conntrack-dev
+          #   * validate the generated ruleset with `nft -c`: nftables
+          #   * lint derle.sh: shellcheck
+          # XDP/BPF tooling (clang, llvm, libbpf-dev, libelf-dev) is only used
+          # by the bpf-build job, and the GUI/X11 stack only by gui-build, so
+          # they are not installed here (clang/llvm also pull a large tree that
+          # is unnecessary on the bullseye leg).
           apt-get install -y --no-install-recommends \
-            build-essential g++ clang llvm libbpf-dev libelf-dev \
-            nftables iproute2 libnetfilter-queue-dev libnetfilter-conntrack-dev \
-            pkg-config libgl1-mesa-dev libglfw3-dev libx11-dev shellcheck
+            build-essential g++ pkg-config \
+            libnetfilter-queue-dev libnetfilter-conntrack-dev \
+            nftables shellcheck
+
+      - name: Record toolchain versions
+        run: |
+          set -o pipefail
+          g++ --version | head -1
+          nft --version
+          shellcheck --version | head -2
+          pkg-config --modversion libnetfilter_queue libnetfilter_conntrack
 
       - name: Build daemon (--with-dpi, warnings as errors)
         run: |
