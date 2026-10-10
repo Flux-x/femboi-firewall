@@ -700,6 +700,16 @@ void load_counters(Snapshot& s) {
     bool found_ingress = false;
     unsigned long long fallback_traffic = 0;
 
+    auto format_pk = [](unsigned long long count) -> std::string {
+        if (count >= 1000000ULL) {
+            char b[32]; snprintf(b, sizeof(b), "%.1fM pkts", count / 1000000.0); return b;
+        }
+        if (count >= 1000ULL) {
+            char b[32]; snprintf(b, sizeof(b), "%.1fK pkts", count / 1000.0); return b;
+        }
+        return std::to_string(count) + " pkts";
+    };
+
     if (!out.empty()) {
         s.table_present = true;
         size_t pos = 0;
@@ -712,6 +722,11 @@ void load_counters(Snapshot& s) {
             size_t line_end = out.find('\n', pos);
             std::string line = out.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
 
+            size_t line_start = out.rfind('\n', pos);
+            if (line_start == std::string::npos) line_start = 0;
+            else line_start += 1;
+            std::string full_rule = out.substr(line_start, line_end == std::string::npos ? std::string::npos : line_end - line_start);
+
             if (line.find("traffic_all") != std::string::npos) {
                 s.traffic = pk;
                 found_ingress = true;
@@ -721,6 +736,47 @@ void load_counters(Snapshot& s) {
 
             if (line.find("drop") != std::string::npos) {
                 s.blocked += pk;
+                if (pk > 0) {
+                    std::string cat_name, desc;
+                    if (full_rule.find("broadcast") != std::string::npos || full_rule.find("multicast") != std::string::npos) {
+                        cat_name = "L2-Broadcast";
+                        desc = "Broadcast/Multicast Flood (" + format_pk(pk) + ")";
+                    } else if (full_rule.find("@dc_blocked") != std::string::npos) {
+                        cat_name = "Datacenter-ASN";
+                        desc = "Cloud/Hosting IP Range (" + format_pk(pk) + ")";
+                    } else if (full_rule.find("@geo_blocked") != std::string::npos) {
+                        cat_name = "Geo-Filter";
+                        desc = "Blocked Country Range (" + format_pk(pk) + ")";
+                    } else if (full_rule.find("stealth_blackhole_drop") != std::string::npos) {
+                        cat_name = "Stealth-Drop";
+                        desc = "Unsolicited Port Probe (" + format_pk(pk) + ")";
+                    } else if (full_rule.find("0.0.0.0/8") != std::string::npos) {
+                        cat_name = "0.0.0.0/8";
+                        desc = "Bogon/Martian Spoofed Source (" + format_pk(pk) + ")";
+                    } else if (full_rule.find("mgmt") != std::string::npos || full_rule.find("{ 21, 23") != std::string::npos) {
+                        cat_name = "Port-Scan";
+                        desc = "Management Ports Probe (" + format_pk(pk) + ")";
+                    } else if (full_rule.find("invalid") != std::string::npos) {
+                        cat_name = "Invalid-State";
+                        desc = "Malformed TCP/UDP Flags (" + format_pk(pk) + ")";
+                    } else if (full_rule.find("a2s_flood") != std::string::npos) {
+                        cat_name = "A2S-Flood";
+                        desc = "A2S Query Amplification (" + format_pk(pk) + ")";
+                    } else if (full_rule.find("syn_flood") != std::string::npos) {
+                        cat_name = "SYN-Flood";
+                        desc = "TCP Handshake Flood (" + format_pk(pk) + ")";
+                    } else if (full_rule.find("port_bw_") != std::string::npos) {
+                        cat_name = "Bandwidth-Cap";
+                        desc = "Port Bandwidth Limit (" + format_pk(pk) + ")";
+                    } else if (full_rule.find("port_") != std::string::npos) {
+                        cat_name = "Port-RateLimit";
+                        desc = "Port PPS Threshold (" + format_pk(pk) + ")";
+                    } else {
+                        cat_name = "Filter-Drop";
+                        desc = "Dropped Threat Packets (" + format_pk(pk) + ")";
+                    }
+                    s.recent_blocks.push_back(cat_name + "  " + desc);
+                }
             }
 
             size_t port_pos = line.find("port_");
@@ -746,51 +802,51 @@ void load_counters(Snapshot& s) {
 }
 
 void load_bans(Snapshot& s) {
-    std::string out = nft({"-a", "list", "set", "inet", "femboifw", "banned"});
-    if (out.empty()) return;
     s.table_present = true;
+    std::string out = nft({"-a", "list", "set", "inet", "femboifw", "banned"});
+    if (!out.empty()) {
+        size_t p = out.find("elements = {");
+        if (p != std::string::npos) {
+            size_t end = out.find('}', p);
+            std::string body = out.substr(p + 12, end == std::string::npos ? std::string::npos : end - p - 12);
 
-    size_t p = out.find("elements = {");
-    if (p != std::string::npos) {
-        size_t end = out.find('}', p);
-        std::string body = out.substr(p + 12, end == std::string::npos ? std::string::npos : end - p - 12);
+            size_t i = 0;
+            while (i < body.size()) {
+                while (i < body.size() && !isdigit((unsigned char)body[i])) i++;
+                size_t start = i;
+                while (i < body.size() && (isdigit((unsigned char)body[i]) || body[i] == '.')) i++;
+                if (i <= start) break;
 
-        size_t i = 0;
-        while (i < body.size()) {
-            while (i < body.size() && !isdigit((unsigned char)body[i])) i++;
-            size_t start = i;
-            while (i < body.size() && (isdigit((unsigned char)body[i]) || body[i] == '.')) i++;
-            if (i <= start) break;
+                BanRow b;
+                b.ip = body.substr(start, i - start);
 
-            BanRow b;
-            b.ip = body.substr(start, i - start);
-
-            size_t line_end = body.find('\n', i);
-            {
-                std::lock_guard<std::mutex> lk(g_unban_mutex);
-                double now = glfwGetTime();
-                auto it = g_unbanned_recent.find(b.ip);
-                if (it != g_unbanned_recent.end()) {
-                    if (now - it->second < 25.0) {
-                        i = line_end == std::string::npos ? body.size() : line_end + 1;
-                        continue;
-                    } else {
-                        g_unbanned_recent.erase(it);
+                size_t line_end = body.find('\n', i);
+                {
+                    std::lock_guard<std::mutex> lk(g_unban_mutex);
+                    double now = glfwGetTime();
+                    auto it = g_unbanned_recent.find(b.ip);
+                    if (it != g_unbanned_recent.end()) {
+                        if (now - it->second < 25.0) {
+                            i = line_end == std::string::npos ? body.size() : line_end + 1;
+                            continue;
+                        } else {
+                            g_unbanned_recent.erase(it);
+                        }
                     }
                 }
+                std::string rest = body.substr(i, line_end == std::string::npos ? std::string::npos : line_end - i);
+                size_t e = rest.find("expires");
+                if (e != std::string::npos) {
+                    b.remain_sec = parse_nft_duration(rest.c_str() + e + 7);
+                    b.reason = "auto / temporary";
+                } else {
+                    b.reason = "permanent";
+                }
+                b.port = 0;
+                s.bans.push_back(b);
+                s.recent_blocks.push_back(b.ip + "  banned (" + b.reason + ")");
+                i = line_end == std::string::npos ? body.size() : line_end + 1;
             }
-            std::string rest = body.substr(i, line_end == std::string::npos ? std::string::npos : line_end - i);
-            size_t e = rest.find("expires");
-            if (e != std::string::npos) {
-                b.remain_sec = parse_nft_duration(rest.c_str() + e + 7);
-                b.reason = "auto / temporary";
-            } else {
-                b.reason = "permanent";
-            }
-            b.port = 0;
-            s.bans.push_back(b);
-            s.recent_blocks.push_back(b.ip + "  banned");
-            i = line_end == std::string::npos ? body.size() : line_end + 1;
         }
     }
 
@@ -809,7 +865,6 @@ void load_bans(Snapshot& s) {
                 if (i <= start) break;
                 std::string ip = body_ports.substr(start, i - start);
 
-                // Skip spaces and '.' to parse port
                 while (i < body_ports.size() && (body_ports[i] == ' ' || body_ports[i] == '.')) i++;
                 size_t pstart = i;
                 while (i < body_ports.size() && isdigit((unsigned char)body_ports[i])) i++;
@@ -865,6 +920,57 @@ void load_bans(Snapshot& s) {
         for (size_t idx = start_idx; idx < dlines.size(); ++idx) {
             s.recent_blocks.push_back(dlines[idx]);
         }
+    }
+}
+
+void load_dmesg_blocks(Snapshot& s) {
+    static double s_last_dmesg = 0.0;
+    static std::vector<std::string> s_cached_dmesg;
+    double now = glfwGetTime();
+    if (now - s_last_dmesg >= 1.5 || s_cached_dmesg.empty()) {
+        s_last_dmesg = now;
+        s_cached_dmesg.clear();
+        std::string out = sh_capture({"dmesg"});
+        if (!out.empty()) {
+            size_t p = 0;
+            std::vector<std::string> lines;
+            while (p < out.size()) {
+                size_t nl = out.find('\n', p);
+                std::string line = out.substr(p, nl == std::string::npos ? std::string::npos : nl - p);
+                if (line.find("femboifw") != std::string::npos) {
+                    lines.push_back(line);
+                }
+                if (nl == std::string::npos) break;
+                p = nl + 1;
+            }
+            size_t start = lines.size() > 25 ? lines.size() - 25 : 0;
+            for (size_t i = start; i < lines.size(); ++i) {
+                const std::string& l = lines[i];
+                size_t src_pos = l.find("SRC=");
+                if (src_pos != std::string::npos) {
+                    size_t sp = l.find(' ', src_pos);
+                    std::string ip = l.substr(src_pos + 4, sp == std::string::npos ? std::string::npos : sp - src_pos - 4);
+                    std::string tag = "drop";
+                    size_t fw_pos = l.find("femboifw ");
+                    if (fw_pos != std::string::npos) {
+                        size_t end_tag = l.find(' ', fw_pos + 9);
+                        if (end_tag != std::string::npos) {
+                            tag = l.substr(fw_pos + 9, end_tag - fw_pos - 9);
+                        }
+                    }
+                    size_t dpt_pos = l.find("DPT=");
+                    if (dpt_pos != std::string::npos) {
+                        size_t sp2 = l.find(' ', dpt_pos);
+                        std::string dpt = l.substr(dpt_pos + 4, sp2 == std::string::npos ? std::string::npos : sp2 - dpt_pos - 4);
+                        tag += " (port " + dpt + ")";
+                    }
+                    s_cached_dmesg.push_back(ip + "  " + tag);
+                }
+            }
+        }
+    }
+    for (const auto& item : s_cached_dmesg) {
+        s.recent_blocks.push_back(item);
     }
 }
 
@@ -1252,10 +1358,23 @@ void refresh(Snapshot& s) {
     fresh.machine = local_hostname();
 
     load_config(fresh);
-    load_bans(fresh);
     load_counters(fresh);
+    load_bans(fresh);
+    load_dmesg_blocks(fresh);
     load_players(fresh);
     load_geo_rules(fresh);
+
+    // Deduplicate recent_blocks while keeping order
+    {
+        std::vector<std::string> unique_blocks;
+        std::set<std::string> seen;
+        for (const auto& item : fresh.recent_blocks) {
+            if (seen.insert(item).second) {
+                unique_blocks.push_back(item);
+            }
+        }
+        fresh.recent_blocks = std::move(unique_blocks);
+    }
 
     double now = glfwGetTime();
     if (s.timestamp <= 0.0) {
@@ -1781,9 +1900,9 @@ void draw_ozet(const Snapshot& s, Snapshot& mut, int& selected_port) {
         ImGui::TextUnformatted("No attack events in current window. System clean.");
         ImGui::PopStyleColor();
     } else if (ImGui::BeginTable("##recent_table", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY)) {
-        ImGui::TableSetupColumn("IP Address", ImGuiTableColumnFlags_WidthStretch, 1.4f);
-        ImGui::TableSetupColumn("Attack Vector", ImGuiTableColumnFlags_WidthStretch, 1.2f);
-        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 65);
+        ImGui::TableSetupColumn("IP / Threat Source", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        ImGui::TableSetupColumn("Attack Vector", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 75);
         ImGui::TableHeadersRow();
 
         int recent_row_id = 0;
@@ -1792,9 +1911,10 @@ void draw_ozet(const Snapshot& s, Snapshot& mut, int& selected_port) {
             ImGui::PushID(recent_row_id++);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            size_t sp = line.find(' ');
+            size_t sp = line.find("  ");
+            if (sp == std::string::npos) sp = line.find(' ');
             std::string ip = (sp != std::string::npos) ? line.substr(0, sp) : line;
-            std::string reason = (sp != std::string::npos) ? line.substr(sp + 1) : "flood/scan";
+            std::string reason = (sp != std::string::npos) ? line.substr(sp + (line[sp+1] == ' ' ? 2 : 1)) : "flood/scan";
             trim(reason);
             render_copyable_ip(ip, ip, &ColBad);
 
@@ -1802,9 +1922,16 @@ void draw_ozet(const Snapshot& s, Snapshot& mut, int& selected_port) {
             ImGui::TextUnformatted(reason.c_str());
 
             ImGui::TableNextColumn();
-            ImGui::PushStyleColor(ImGuiCol_Text, ColText2);
-            ImGui::TextUnformatted("DROPPED");
-            ImGui::PopStyleColor();
+            bool is_ban = (reason.find("ban") != std::string::npos);
+            if (is_ban) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ColAmber);
+                ImGui::TextUnformatted("BANNED");
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, ColBad);
+                ImGui::TextUnformatted("DROPPED");
+                ImGui::PopStyleColor();
+            }
             ImGui::PopID();
         }
         ImGui::EndTable();

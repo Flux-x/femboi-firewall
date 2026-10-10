@@ -56,7 +56,8 @@ check:
 install: $(BIN)
 	install -d /usr/local/bin
 	install -m 0755 $(BIN) /usr/local/bin/$(BIN)
-	@echo "installed /usr/local/bin/$(BIN)"
+	cp -f /usr/local/bin/$(BIN) /usr/local/bin/fluxxfw-gui
+	@echo "installed /usr/local/bin/$(BIN) and synced /usr/local/bin/fluxxfw-gui"
 
 clean:
 	rm -f $(BIN)
