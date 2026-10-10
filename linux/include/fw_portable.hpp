@@ -80,8 +80,9 @@ inline PacketType parse_packet_type(const unsigned char* payload, unsigned int l
         }
         if (type == 'c' || type == 's' || type == 'e') return PKT_GAME;
 
-        if (payload[4] == 'l' && len > 4096) return PKT_EXPLOIT;
-
+        // NOTE: no `payload[4] == 'l' && len > 4096` check here. An earlier
+        // `len > 2048` in this same out-of-band branch already returns
+        // PKT_EXPLOIT, so a 4096 threshold is unreachable dead code.
         if (type == 'T') {
             if (len >= 25 && memcmp(payload + 4, "TSource Engine Query", 20) == 0) {
                 return PKT_A2S_INFO;

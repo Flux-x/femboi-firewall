@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 
 #include <atomic>
@@ -183,12 +184,15 @@ int cmd_attach(const std::string& iface, const std::string& mode,
 // Cancel a pending rollback timer (one-shot marker consumed by the watchdog).
 int cmd_attach_confirm(const std::string& pin_dir) {
     const std::string marker = pin_dir + "/rollback.cancel";
-    FILE* f = ::fopen(marker.c_str(), "wb");
-    if (!f) {
+    // Create with explicit 0600 rather than fopen's umask-dependent default:
+    // the marker sits in the (root-owned) pin dir and grants whoever can
+    // write it the ability to cancel a pending rollback, so keep it off-world.
+    const int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
         std::cerr << "error: cannot write " << marker << "\n";
         return 1;
     }
-    ::fclose(f);
+    ::close(fd);
     std::cout << "[+] rollback cancelled\n";
     return 0;
 }
