@@ -158,8 +158,15 @@ int queue_cb(struct nfq_q_handle* qh, struct nfgenmsg* /*nfmsg*/,
     }
     ctx->drops->fetch_add(1, std::memory_order_relaxed);
 
-    Logf(3, "DPI drop %s:%u -> :%u proto=%u (%s)",
-         FormatIp(src_nbo).c_str(), sport, dport, proto, reason.c_str());
+    const std::string src_ip = FormatIp(src_nbo);
+    Logf(1, "DPI drop %s:%u -> :%u proto=%u (%s)",
+         src_ip.c_str(), sport, dport, proto, reason.c_str());
+
+    FILE* fp = std::fopen("/var/log/femboi-drops.log", "a");
+    if (fp) {
+        std::fprintf(fp, "%s  DPI:%s\n", src_ip.c_str(), reason.c_str());
+        std::fclose(fp);
+    }
 
     return nfq_set_verdict(qh, id, NF_DROP, 0, nullptr);
 }

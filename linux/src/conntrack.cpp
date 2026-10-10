@@ -19,8 +19,17 @@
 
 #include <arpa/inet.h>
 #include <libnetfilter_conntrack/libnetfilter_conntrack.h>
+#if __has_include(<linux/netfilter/nf_conntrack_tcp.h>)
+#include <linux/netfilter/nf_conntrack_tcp.h>
+#endif
 #include <poll.h>
 #include <unistd.h>
+
+#ifndef _NF_CONNTRACK_TCP_H
+enum {
+    TCP_CONNTRACK_ESTABLISHED = 3
+};
+#endif
 
 #include <cerrno>
 #include <unordered_map>
@@ -73,7 +82,12 @@ int conntrack_cb(enum nf_conntrack_msg_type type, struct nf_conntrack* ct, void*
     if (++slot.second > ctx->threshold) {
         if (ctx->on_ban && (*ctx->on_ban)(src, "conntrack-handshake-flood")) {
             ctx->handshakes.erase(src);
-            Logf(3, "conntrack: banned %s (handshake flood)", FormatIp(src).c_str());
+            Logf(1, "conntrack: banned %s (handshake flood)", FormatIp(src).c_str());
+            FILE* fp = std::fopen("/var/log/femboi-drops.log", "a");
+            if (fp) {
+                std::fprintf(fp, "%s  conntrack:handshake-flood\n", FormatIp(src).c_str());
+                std::fclose(fp);
+            }
         }
     }
 

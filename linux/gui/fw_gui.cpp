@@ -848,6 +848,23 @@ void load_bans(Snapshot& s) {
             }
         }
     }
+
+    // 3. Load recent DPI and attack drop events from persistent log
+    std::string drop_log = read_file("/var/log/femboi-drops.log");
+    if (!drop_log.empty()) {
+        std::istringstream iss(drop_log);
+        std::string line;
+        std::vector<std::string> dlines;
+        while (std::getline(iss, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+                line.pop_back();
+            if (!line.empty()) dlines.push_back(line);
+        }
+        size_t start_idx = dlines.size() > 40 ? dlines.size() - 40 : 0;
+        for (size_t idx = start_idx; idx < dlines.size(); ++idx) {
+            s.recent_blocks.push_back(dlines[idx]);
+        }
+    }
 }
 
 // Same line-oriented format the Windows GUI writes and the daemon reads.
